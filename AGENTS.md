@@ -2,6 +2,9 @@
 
 > Instructions for AI coding agents working in this repo.
 
+Public name: **Ziggy's Durable HITL Agents**, Ziggy's multi-agent HITL demo (the README
+title and `pyproject.toml`). The dashboard and workflow ids still say **Meltdown**.
+
 Conference demo for the AI Engineer World's Fair talk **"The Human Is an Async
 API: Designing Durable Human-in-the-Loop Agents."** It shows **two** durable
 human-in-the-loop patterns across **three use cases** (one per tab) on Temporal,
@@ -52,13 +55,18 @@ not a third pattern):
 **Terminology (keep these terms straight in code + docs).** The spine is two parts:
 **framework** and **durable-execution runtime / substrate**. *Frameworks own the loop*
 (observe → reason → act) and the agent abstractions — **ADK and LangGraph** — and each
-framework stops at its own edge; Temporal never runs the loop. *Temporal is the
-**durable-execution runtime** (the substrate)* beneath the frameworks: persistence,
-retries, replay, HITL waits (`wait_condition`/`signal`), versioning. It is the layer
-everything runs on — woven throughout, not a component beside the others — and the **only
-thing that coordinates ACROSS frameworks**. Canonical sentence: *"Frameworks own the loop
-— ADK, LangGraph. Temporal is the durable-execution runtime (the substrate) beneath them,
-and the only thing that coordinates across them."* Naming rules: do **not** call Temporal
+framework stops at its own edge. The framework decides what the agent does next; its loop
+code runs inside a Temporal workflow, so each model call and tool call is a recorded step.
+*Temporal is the **durable-execution runtime** (the substrate)* beneath the frameworks:
+persistence, retries, replay, HITL waits (`wait_condition`/`signal`), versioning. It is the
+layer everything runs on — woven throughout, not a component beside the others — and in
+this demo it is what makes the **handoff between the two frameworks durable**. Canonical
+sentence: *"Frameworks own the loop — ADK, LangGraph. Their loop code runs inside Temporal
+workflows; Temporal is the durable-execution runtime beneath them, and in this demo it is
+what makes the handoff between the two frameworks durable."* Don't claim Temporal is the
+only way to connect frameworks (plain code or A2A can); claim what it adds — a handoff that
+survives crashes and retries and shows up in history. Always Temporal **with** ADK and
+LangGraph, never instead of them. Naming rules: do **not** call Temporal
 a "control plane" / "agent control plane" (durable execution is the substrate that control
 planes run *on* — the only allowed control-plane phrase is the architect line, *"the same
 durable execution Temporal uses to build its own cloud control plane"*); always **qualify
@@ -85,7 +93,12 @@ not as demo use cases.
 
 `run.sh` starts three processes: Temporal dev server, worker (`python -m agent_fleet.worker`),
 and FastAPI server (`python -m agent_fleet.server`). No manual Temporal setup needed. App is
-served at http://localhost:8080; Temporal UI at http://localhost:8233.
+served at http://localhost:8080; Temporal UI at http://localhost:8233. After startup, the
+worker exiting (`make kill-worker` / `make stop-worker`) does **not** end `run.sh`: it prints
+a one-line notice and keeps Temporal and the server up so the parked workflows survive for
+`make worker`. Ctrl-C, or Temporal or the server exiting, stops everything `run.sh` started
+(and the in-memory dev server's history with it). Keep that contract if you edit `run.sh`;
+the crash-and-recover demo depends on it.
 
 The worker does **not** load `.env` itself. To run it directly in live mode, pass the env file:
 
@@ -100,14 +113,17 @@ The server loads `.env` via `load_dotenv()`. Two keys are required for live mode
 
 - **Two separate processes**: FastAPI server (`server.py`) reads FleetState (SQLite) for the
   WebSocket snapshot and sends signals / runs queries only — no workers. Workers run in a
-  separate process (`worker.py`). The worker is live-only and requires `GOOGLE_API_KEY`
-  (no mock mode).
+  separate process (`worker.py`). The worker is live-only and requires `GOOGLE_API_KEY` and
+  `GOOGLE_MAPS_API_KEY` (no mock mode).
 - **Workflows own state** (`workflows.py`): `MeltdownDemoWorkflow` owns driver positions, order
   assignments, and disconnect status. Builds `DriverSnapshot`s and passes to activities as inputs.
-  The **Dispatch agent picks the driver itself** (`submit_assignment` / `submit_dispatch`, from
+  The **Dispatch agent proposes the driver** (`submit_assignment` / `submit_dispatch`, from
   the eligible — connected, under-capacity — set). Capacity guardrail: the parent commits the
   agent's chosen driver if still eligible, else falls back to the least-loaded eligible one
-  (`_least_loaded_driver()`, also the default proposal seeded into the agent). The fleet is a
+  (`_least_loaded_driver()`, also the default proposal seeded into the agent). On the **adk**
+  path only, `_run_adk_assignment` then swaps a valid pick for the least-loaded eligible
+  driver when that driver has fewer orders ("Spread load across the fleet"); don't document
+  the ADK pick as final. The fleet is a
   deliberately tight **4 drivers (A–D) at capacity 2** (`DRIVER_IDS`, `DRIVER_CAPACITY`), so
   capacity is scarce and the agent must reason about free slots; `WARMUP_HIDDEN` keeps driver-d
   back during the warm-up burst. Orders assigned while Fleet Agent is offline get `degraded=True`.
@@ -153,8 +169,10 @@ The server loads `.env` via `load_dotenv()`. Two keys are required for live mode
   `await handle` join.
   `OrderGenerationWorkflow` is a child workflow that generates orders on a randomized timer and
   signals the parent. Parent handles assignment. Auto-generated orders top out at ~$1,950
-  (servings ≤150 × ≤$13) and the agent only escalates genuinely high-value orders, so routine
-  orders auto-dispatch — the agent calls `ask_human` only on the deliberately injected premium order.
+  (servings ≤150 × ≤$13) and the prompt steers the agent to escalate only exceptional orders
+  (roughly $3,000+), so routine orders usually auto-dispatch — the injected $5,400 premium
+  order is the one written to make the agent call `ask_human`. It is the model's call, not a
+  code rule; Fleet may ask before Dispatch, so one order can produce two cards.
 - **Pattern B — in-loop `ask_human`** (`langgraph_agents.py`): the agent-in-the-loop path, selected
   by the langgraph tab for **all** orders. `_assign_order` runs `_run_langgraph_assignment` INLINE in
   the parent as a concurrent task — the fleet keeps moving while the agents (and possibly a human)
@@ -195,8 +213,20 @@ The server loads `.env` via `load_dotenv()`. Two keys are required for live mode
   on the `answer_dispatch` signal (via `_await_dispatch_answer`), then resumes the agent with
   `Command(resume=answer)` — the answer flows back as the agent's next observation. No per-order
   child workflow. On a `DISPATCH` decision the parent calls `_commit_assignment`; on `HOLD`/reject it
-  calls `_reject_order` (cancels the order, preserves fleet capacity). `_await_dispatch_answer` also
+  calls `_reject_order` (cancels the order, preserves fleet capacity). `_reject_order(...,
+  agent_hold=...)` publishes "Supervisor rejected …" only for a human reject; when the agent
+  held on its own it publishes "Dispatch agent held order … after a human approved it" (or
+  "… without asking a human"). These go out as `dispatch_gate` events, which the frontend
+  doesn't render (it shows only `fleet_agent` / `customer_agent` / `resolver`), so on screen
+  either kind of HOLD is just "… — held" in the Dispatch panel; don't document the
+  attribution as visible. `_await_dispatch_answer` waits `GATE_ESCALATION_SECONDS`
+  (imported from `config.py`, default 30, env-overridable), then marks the pending entry
+  `escalated` / `approver_tier="backup"` and waits with no timeout. It also
   unblocks on `_routes_done` (returns `None`) so demo shutdown can't hang a parked workflow.
+  The plain-text fallback in `dispatch_reason` (used only when the model skips
+  `submit_dispatch`) goes through `_text_decision`: HOLD only when the reply *leads* with
+  "hold"/"held" (optionally after "Decision:"), so "No need to hold — dispatch driver-a" is
+  DISPATCH.
   LangGraph callables that run inline in the workflow are `async` because LangGraph offloads sync
   callables to a thread executor, which Temporal's deterministic event loop forbids.
 - **Cross-Framework — ADK child → LangGraph child** (`workflows.py`,
@@ -238,13 +268,27 @@ The server loads `.env` via `load_dotenv()`. Two keys are required for live mode
   parks (sets `self._pending_question`), waits on a Temporal signal, and resumes with
   `Command(resume=answer)`. It owns `@workflow.signal answer_dispatch(decision: str)`
   (single arg — the child IS the order), `@workflow.query pending_question() -> dict | None`,
-  and `@workflow.signal stop()`. Robust decision: `HOLD` if rejected or `"HOLD"` is in
-  the text, else `DISPATCH`.
+  and `@workflow.signal stop()`. It uses the same `GATE_ESCALATION_SECONDS` window, then
+  sets `approver_tier="backup"` / `escalated` on the pending question and keeps waiting.
+  Robust decision: `HOLD` if the human rejected, or the agent's `submit_dispatch` decision
+  is `hold`, or a plain-text reply leads with HOLD/held (`_text_decision` in
+  `langgraph_agents.py`); else `DISPATCH`. `LgDispatchOutput` has no human-rejected flag, so
+  on this tab the parent publishes "Supervisor rejected …" for every HOLD, including an
+  agent hold after an approve. The `-rev<n>` re-reason children get the order's real `event`
+  and `order_value` (stored in `self._orders`), so a high-value `-rev1` Dispatch agent may
+  call `ask_human` again, and the held driver waits for that answer.
 - **Server reads FleetState** (`server.py`): WebSocket data comes from `fleet.snapshot()` (SQLite).
   Server also writes disconnect/reconnect state directly. Temporal queries used for structural
   state during development — FleetState is the display authority.
-- **Activities are pure** (`activities.py`): receive all decision data as inputs, never read
-  FleetState for logic. `@activity.defn` with no `name=` override (function names are activity names).
+- **Activities** (`activities.py`): receive decision data as inputs. Some read FleetState:
+  `navigate_to` reads the driver's start position, the agent tools read fleet status and order
+  priorities, and the dormant disconnect checks read disconnect flags. Workflows never read
+  FleetState. `@activity.defn` with no `name=` override (function names are activity names).
+  The two Maps Directions activities (`get_route_polyline`, `tool_get_route_info`) keep the
+  API key out of errors: non-2xx → `RuntimeError("Maps Directions API HTTP <code>")`,
+  transport errors → `RuntimeError("Maps Directions API request failed: <ErrorType>") from
+  None`. Never use `raise_for_status()` or log the request URL there; the key is in the query
+  string, and `worker.py` sets the `httpx` logger to WARNING for the same reason.
 - **FleetState** (`simulation.py`): SQLite WAL-backed UI projection. Backed by `fleet_state.db`
   for cross-process sharing — activities in the worker write positions/statuses, server reads
   for the frontend WebSocket. In production this would be Redis or Postgres.
@@ -299,8 +343,9 @@ The server loads `.env` via `load_dotenv()`. Two keys are required for live mode
   calls `ask_human` mid-loop and the parent surfaces the question), `POST /api/approve-dispatch`
   (signals the parent `MeltdownDemoWorkflow.answer_dispatch` — the durable async endpoint the
   agent's in-loop `ask_human` interrupt is parked on; no gate child involved).
-  Cross-Framework wiring: `_MODES` adds `"crossframework"` (guarded in `StartRequest` /
-  `DispatchModeRequest` / `start_demo`). `GET /api/pending-dispatch` now handles the
+  Cross-Framework wiring: `DispatchMode = Literal["adk", "langgraph", "crossframework"]`
+  types `StartRequest.mode` / `DispatchModeRequest.mode`, so an unknown mode is a validation
+  error (`tests/test_server.py`). `GET /api/pending-dispatch` now handles the
   roll-up entries the crossframework path puts in `pending_dispatch`: when an entry has
   `via_child` / `child_id`, the server does a **second** query — to that child's
   `LgDispatchWorkflow.pending_question` — and merges the agent/question in (workflows
@@ -317,7 +362,13 @@ The server loads `.env` via `load_dotenv()`. Two keys are required for live mode
   Cross tabs via `data-role` attributes plus an active-panel `ccEl()` scope helper. On
   the cross tab the header shows **both** the ADK and LangGraph logos, and a single
   "View the cross-framework graph" combined SVG modal (`#cross-modal` / `openCross` /
-  `closeCross`) renders the ADK→LangGraph handoff.
+  `closeCross`) renders the ADK→LangGraph handoff (children run in sequence, not in
+  parallel). The default map style is `DEFAULT_TILE = 'Dark (OpenStreetMap)'` (OSM tiles
+  darkened by a CSS filter on the tile pane, with the OSM attribution control); the CARTO
+  styles were removed because they now need a key. The `ask_human` card shows the full
+  `order_id` and the workflow to signal (`meltdown-demo`, or the `dispatch-…` child id) and
+  re-renders only when its HTML changes, so the ids can be copied. It is driven by a Query,
+  so it disappears while no worker is running.
 - **PydanticPayloadConverter** on `Client.connect` in both server and worker for `LlmResponse`
   serialization.
 
@@ -326,19 +377,31 @@ The server loads `.env` via `load_dotenv()`. Two keys are required for live mode
 - Dataclass models for all Temporal payloads (`models.py`). `dispatch_mode` is a
   3-value field (`"adk"` / `"langgraph"` / `"crossframework"`, set by the active UI tab;
   documented on `MeltdownDemoInput.dispatch_mode`). The cross-framework child contracts
-  are dataclasses with **all fields defaulted for replay-safety**:
-  `AdkAssessmentOutput(fleet_assessment, customer_assessment)`;
+  are dataclasses; add any new field **with a default** for replay-safety:
+  `AdkAssessmentOutput(fleet_assessment="", customer_assessment="")`;
   `LgDispatchInput(order_id, venue, order_value, servings, deadline_minutes,
   proposed_driver_id, drivers_available, drivers_total, pending_orders,
-  fleet_assessment, customer_assessment)`;
-  `LgDispatchOutput(decision, reasoning, fleet_assessment, customer_assessment,
-  asked_human)`.
+  fleet_assessment="", customer_assessment="", eligible_drivers=[])`;
+  `LgDispatchOutput(decision="DISPATCH", driver_id="", reasoning="", asked_human=False)`
+  (assessments are deliberately not echoed back, to keep child results thin).
 - Activities and workflows in separate files
 - Worker is live-only and requires both `GOOGLE_API_KEY` and
-  `GOOGLE_MAPS_API_KEY` (no mock mode)
-- Two API keys required: `GOOGLE_API_KEY` (Gemini, Generative Language API) and
-  `GOOGLE_MAPS_API_KEY` (Directions API) — cannot be combined
-- `DEFAULT_MODEL` defaults to `gemini-2.5-flash` (swappable via env)
+  `GOOGLE_MAPS_API_KEY` (no mock mode); `run_worker()` raises at startup if either is
+  missing or still a `your-...` placeholder
+- Two API keys required: `GOOGLE_API_KEY` (Gemini, Generative Language API, paid tier) and
+  `GOOGLE_MAPS_API_KEY` (Directions API) — cannot be combined; use a separate key for each,
+  restricted to its API
+- `DEFAULT_MODEL` defaults to `gemini-3.8-flash` (`config.py`; swappable via env). Google now
+  serves `gemini-2.5-flash` only to keys that used it before, and 3.8 Flash has no Grounding
+  with Google Search on the free tier, so the Gemini key needs billing. Every agent reads
+  `config.DEFAULT_MODEL`; don't hard-code a model name elsewhere. All three tabs were
+  measured end to end on `gemini-3.8-flash` on 2026-09-30 (README, Cost to run)
+- `GATE_ESCALATION_SECONDS` (default 30) lives in `config.py` and is imported into
+  `workflows.py` inside `imports_passed_through()`; it's read once per worker process
+- `DRIVER_CAPACITY = 2` is defined in both `workflows.py` (enforced) and `simulation.py` (what
+  the Fleet tool reports); keep them equal
+- Cost is always stated as tokens AND dollars (model, settings, calls, tokens, $, measured vs
+  estimated, date). `scripts/token_usage.py` measures a pass from local Temporal history
 - Geography is **downtown San Francisco** (`locations.py`). Random order generation from 3
   venues: **Moscone Center** (platinum tier — the premium target that makes the agent call `ask_human`),
   **Fisherman's Wharf** (silver), **Chinatown** (gold). The reroute-only destination is
@@ -346,8 +409,10 @@ The server loads `.env` via `load_dotenv()`. Two keys are required for live mode
   legacy field name; values are SF venue names.
 - Drivers use letter IDs: `driver-a` through `driver-d` (4 drivers), displayed as `Driver-A` etc.
 - Ice cream shop is "Ziggy's Ice Cream" = the **Ferry Building** (`WAREHOUSE_LABEL` in `locations.py`)
-- Auto-generated orders top out at ~$1,950 and the agent escalates only genuinely high-value
-  orders, so routine orders auto-dispatch; only the injected premium order makes the agent call `ask_human`
+- Auto-generated orders top out at ~$1,950 and the prompt steers the agent to escalate only
+  exceptional orders, so routine orders usually auto-dispatch; the injected $5,400 premium order
+  (`order-special-<n>`, a server-process counter that Reset doesn't clear) is the one written to
+  make the agent call `ask_human`
 - Max 50 orders per demo run; 4 drivers at `DRIVER_CAPACITY = 2`, so each batches up to 2 orders
 
 ## Commands
@@ -361,12 +426,19 @@ uv run ruff check .    # lint
 uv run ruff format .   # format
 uv run pytest          # run tests
 make lint              # ruff check + format check (via uv)
-make fmt               # ruff format (via uv)
+make fmt               # ruff fix + format (via uv)
 make test              # pytest (via uv)
 make run               # start the demo
+make kill-worker       # SIGKILL the worker (a real crash); badge goes offline within ~9 s
+make stop-worker       # SIGTERM the worker (graceful); badge goes offline within ~3 s
+make worker            # start a worker with --env-file .env; it replays open workflows
+uv run python scripts/token_usage.py   # tokens + $ per pass from local Temporal history
 ```
 
-Cross-framework verification: gitignored manual spikes under `spikes/langgraph_hitl/` —
+Tests: `uv run pytest -k "not driver_route"` runs offline; the four `driver_route` tests
+download Temporal's time-skipping test server on first run. Cross-framework verification:
+gitignored manual spikes under `spikes/langgraph_hitl/` —
 `crossharness_smoke.py` (ADK child → LangGraph child, low-value → `DISPATCH`, no gate)
 and `crossharness_hitl_smoke.py` (high-value → child parks on `ask_human` →
-reject = `HOLD` / approve = `DISPATCH`). `uv run pytest` is green.
+reject = `HOLD` / approve = `DISPATCH`). `uv run pytest` is green. No automated test kills
+a worker mid-`ask_human`.
