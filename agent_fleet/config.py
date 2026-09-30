@@ -15,3 +15,8 @@ FLEET_DB_PATH: str = os.environ.get(
 )
 # Seconds an unanswered ask_human waits before escalating to a backup approver (short for the demo).
 GATE_ESCALATION_SECONDS: int = int(os.environ.get("GATE_ESCALATION_SECONDS", "30"))
+# Temporal owns retries: every LLM client makes one attempt, so a failed model call fails its
+# Activity and the Activity retry policy retries it, where each attempt shows up in history.
+# google-genai counts the first request in `attempts`, so there it becomes attempts=1.
+# Not covered: google-genai's async aiohttp path resends once after a connection failure.
+LLM_MAX_RETRIES: int = 0

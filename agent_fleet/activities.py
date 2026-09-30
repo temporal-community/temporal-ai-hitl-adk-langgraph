@@ -156,12 +156,18 @@ async def tool_search_venue_events(venue: str) -> str:
     from google import genai
     from google.genai import types
 
-    from agent_fleet.config import DEFAULT_MODEL, GOOGLE_API_KEY
+    from agent_fleet.config import DEFAULT_MODEL, GOOGLE_API_KEY, LLM_MAX_RETRIES
 
     if not GOOGLE_API_KEY:
         return f"Event search unavailable for {venue}."
     try:
-        client = genai.Client(api_key=GOOGLE_API_KEY)
+        # One attempt, no client-side retries (google-genai counts the first request).
+        client = genai.Client(
+            api_key=GOOGLE_API_KEY,
+            http_options=types.HttpOptions(
+                retry_options=types.HttpRetryOptions(attempts=LLM_MAX_RETRIES + 1)
+            ),
+        )
         resp = await asyncio.to_thread(
             client.models.generate_content,
             model=DEFAULT_MODEL,

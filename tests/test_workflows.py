@@ -611,3 +611,77 @@ async def test_dispatch_reason_does_not_hold_on_a_mention(monkeypatch):
         }
     )
     assert out["dispatch_decision"] == "DISPATCH"
+
+
+# --- Temporal owns retries: LLM clients make one attempt (config.LLM_MAX_RETRIES = 0) ---
+
+
+def _llm_agents(agent) -> list:
+    """Every LlmAgent in an ADK agent tree, depth first."""
+    from google.adk.agents import LlmAgent
+
+    found = [agent] if isinstance(agent, LlmAgent) else []
+    for sub in agent.sub_agents:
+        found.extend(_llm_agents(sub))
+    return found
+
+
+async def test_adk_agents_make_one_attempt_per_model_call():
+    """Each ADK agent asks google-genai for one attempt per request, so a failed model call
+    fails its invoke_model activity and Temporal retries it."""
+    from google.genai._api_client import retry_args
+
+    from agent_fleet.agents import create_assessment_team_agent, create_order_assignment_agent
+
+    agents = _llm_agents(create_order_assignment_agent()) + _llm_agents(
+        create_assessment_team_agent()
+    )
+    assert [a.name for a in agents] == [
+        "assignment_fleet_agent",
+        "assignment_customer_agent",
+        "assignment_dispatch_agent",
+        "assignment_fleet_agent",
+        "assignment_customer_agent",
+    ]
+    for agent in agents:
+        retry = agent.generate_content_config.http_options.retry_options
+        assert retry.attempts == 1, agent.name
+        assert retry_args(retry)["stop"].max_attempt_number == 1, agent.name
+
+
+async def test_langgraph_chat_model_is_built_with_max_retries_0(monkeypatch):
+    """_chat_model passes max_retries=0 to init_chat_model (the langchain-google-genai
+    default is 6 tries inside one activity attempt)."""
+    import langchain.chat_models
+
+    from agent_fleet import langgraph_agents
+    from agent_fleet.config import DEFAULT_MODEL
+
+    calls = []
+
+    def fake_init_chat_model(model, **kwargs):
+        calls.append((model, kwargs))
+        return object()
+
+    monkeypatch.setattr(langchain.chat_models, "init_chat_model", fake_init_chat_model)
+    monkeypatch.delenv("MODEL_PROVIDER", raising=False)
+    langgraph_agents._chat_model()
+    assert calls == [(DEFAULT_MODEL, {"model_provider": "google_genai", "max_retries": 0})]
+
+
+async def test_langgraph_gemini_request_makes_one_attempt(monkeypatch):
+    """max_retries=0 reaches google-genai as a single attempt. langchain-google-genai's docs
+    warn that 0 means "Google's default" (5 tries); the pinned google-genai reads it as one."""
+    from google.genai._api_client import retry_args
+    from langchain_core.messages import HumanMessage
+
+    from agent_fleet import langgraph_agents
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key")  # no request is sent
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("MODEL_PROVIDER", raising=False)
+    model = langgraph_agents._chat_model()
+    assert model.max_retries == 0
+    request = model._prepare_request([HumanMessage(content="hi")])
+    retry = request["config"].http_options.retry_options
+    assert retry_args(retry)["stop"].max_attempt_number == 1

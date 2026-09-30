@@ -205,3 +205,31 @@ async def test_maps_transport_error_does_not_leak_key(
 
     assert exc_info.value.__cause__ is None and exc_info.value.__suppress_context__
     assert FAKE_MAPS_KEY not in _as_recorded_failure(exc_info.value)
+
+
+async def test_venue_search_client_makes_one_attempt(env: ActivityEnvironment, monkeypatch):
+    """The direct google-genai client in the venue search makes one attempt (no client-side
+    retries), the same rule as the agents' model clients."""
+    from types import SimpleNamespace
+
+    from google import genai
+
+    from agent_fleet import config
+
+    clients = []
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            clients.append(kwargs)
+            self.models = SimpleNamespace(
+                generate_content=lambda **kw: SimpleNamespace(text="no notable events")
+            )
+
+    monkeypatch.setattr(genai, "Client", _FakeClient)
+    monkeypatch.setattr(config, "GOOGLE_API_KEY", "test-key")
+
+    result = await env.run(activities.tool_search_venue_events, "Moscone Center")
+
+    assert result == "no notable events"
+    assert clients[0]["api_key"] == "test-key"
+    assert clients[0]["http_options"].retry_options.attempts == 1

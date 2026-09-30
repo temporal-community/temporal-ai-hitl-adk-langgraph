@@ -23,6 +23,7 @@ from google.adk.agents import Agent, ParallelAgent, SequentialAgent
 from google.adk.models.llm_request import LlmRequest
 from google.adk.tools import ToolContext
 from google.adk.tools.google_search_tool import GoogleSearchTool
+from google.genai import types
 from temporalio.common import RetryPolicy
 from temporalio.contrib.google_adk_agents import TemporalModel
 from temporalio.workflow import ActivityConfig
@@ -33,7 +34,7 @@ from agent_fleet.activities import (
     tool_get_order_priorities,
     tool_get_route_info,
 )
-from agent_fleet.config import DEFAULT_MODEL
+from agent_fleet.config import DEFAULT_MODEL, LLM_MAX_RETRIES
 from agent_fleet.queues import AGENTS_QUEUE
 
 _TOOL_RETRY = RetryPolicy(
@@ -52,6 +53,20 @@ _FLEET_TOOL_RETRY = RetryPolicy(
     maximum_interval=timedelta(seconds=5),
     maximum_attempts=2,
 )
+
+
+def _one_attempt_config() -> types.GenerateContentConfig:
+    """No client-side retries on model calls: a failure fails the invoke_model activity and
+    Temporal retries it. The plugin's invoke_model builds ADK's Gemini from the model name, so
+    Gemini(retry_options=...) can't be set; google-genai honors these per-request options.
+    (ADK's internal google_search_agent gets no config and keeps Gemini's default,
+    retry_options=None, which google-genai also treats as one attempt.)
+    """
+    return types.GenerateContentConfig(
+        http_options=types.HttpOptions(
+            retry_options=types.HttpRetryOptions(attempts=LLM_MAX_RETRIES + 1)
+        )
+    )
 
 
 # --- Activity-backed tools (each tool call becomes a Temporal activity) ---
@@ -214,6 +229,7 @@ def create_assignment_fleet_agent() -> Agent:
             activity_config=ActivityConfig(task_queue=AGENTS_QUEUE),
             summary_fn=_build_summary,
         ),
+        generate_content_config=_one_attempt_config(),
         description=(
             "Operational fleet specialist for order assignment. Assesses Driver "
             "positions, capacity, cooler status, and ETAs to recommend the best driver."
@@ -252,6 +268,7 @@ def create_assignment_customer_agent() -> Agent:
             activity_config=ActivityConfig(task_queue=AGENTS_QUEUE),
             summary_fn=_build_summary,
         ),
+        generate_content_config=_one_attempt_config(),
         description=(
             "Customer priority specialist for order assignment. Evaluates order "
             "priority, urgency, deadline pressure, and venue context."
@@ -287,6 +304,7 @@ def create_assignment_dispatch_agent() -> Agent:
             activity_config=ActivityConfig(task_queue=AGENTS_QUEUE),
             summary_fn=_build_summary,
         ),
+        generate_content_config=_one_attempt_config(),
         description=(
             "Dispatch Agent. Synthesizes fleet and customer assessments "
             "to pick the best driver for a new order."

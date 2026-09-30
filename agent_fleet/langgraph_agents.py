@@ -165,10 +165,14 @@ def _chat_model(tools: list | None = None):
 
     from langchain.chat_models import init_chat_model
 
-    from agent_fleet.config import DEFAULT_MODEL
+    from agent_fleet.config import DEFAULT_MODEL, LLM_MAX_RETRIES
 
     provider = os.environ.get("MODEL_PROVIDER", "google_genai")
-    model = init_chat_model(DEFAULT_MODEL, model_provider=provider)
+    # No client-side retries: the *_reason activity fails and Temporal retries it. The
+    # langchain-google-genai default (6) makes up to six tries inside one activity attempt.
+    # Its docs say 0 means "Google's default"; the pinned google-genai 1.75.0 reads 0 as one
+    # attempt (tests/test_workflows.py pins that).
+    model = init_chat_model(DEFAULT_MODEL, model_provider=provider, max_retries=LLM_MAX_RETRIES)
     return model.bind_tools(tools) if tools else model
 
 
