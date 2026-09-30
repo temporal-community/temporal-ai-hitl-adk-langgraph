@@ -256,7 +256,9 @@
     box-shadow: 0 0 44px rgba(0,255,255,0.28); color: #e5f6ff; font-size: 14px; }
   .dgc-header { font-weight: 700; color: #0ff; letter-spacing: .02em; margin-bottom: 10px; }
   .dgc-escalated { background: #7c2d12; color: #fde68a; border: 1px solid #f59e0b; border-radius: 6px; padding: 5px 9px; margin-bottom: 10px; font-weight: 700; font-size: 12px; letter-spacing: .02em; }
-  .dgc-order { font-size: 15px; margin-bottom: 6px; }
+  .dgc-order { font-size: 15px; margin-bottom: 4px; }
+  .dgc-ids { font-size: 12px; color: #9fb4c7; margin-bottom: 8px; }
+  .dgc-ids code { color: #e5f6ff; user-select: all; }  /* one click selects the whole id */
   .dgc-impact { color: #fbbf24; margin-bottom: 8px; }
   .dgc-rec { margin-bottom: 4px; }
   .dgc-reason { font-style: italic; color: #9fb4c7; margin-bottom: 12px; }
@@ -726,6 +728,18 @@
     grid-area: map;
     background: #1a1d28;
   }
+  /* Dark map style: OpenStreetMap tiles inverted into a dark basemap. The filter is on the
+     tile pane only, so markers, routes and signs keep their dark-map styling. */
+  #map.dark-tiles .leaflet-tile-pane {
+    filter: invert(1) hue-rotate(180deg) brightness(.95) contrast(.9);
+  }
+  #map .leaflet-control-attribution {
+    background: rgba(22, 25, 34, 0.8);
+    color: var(--text-muted);
+    font-size: 11px;
+  }
+  #map .leaflet-control-attribution a { color: inherit; }
+  #map .leaflet-control-attribution:empty { display: none; }
   .crew-marker {
     background: none !important;
     border: none !important;
@@ -1043,6 +1057,7 @@
     padding: 10px 14px;
     font-size: 15px;
     font-weight: 500;
+    white-space: nowrap;
     color: var(--text-primary);
     cursor: pointer;
     transition: background 0.1s;
@@ -1461,7 +1476,7 @@
   <div class="graph-modal-backdrop" onclick="closeCross()"></div>
   <div class="graph-modal-card" style="max-width:1480px;">
     <div class="graph-modal-header"><span>🔀 Cross-Framework · ADK + LangGraph</span><button onclick="closeCross()" title="Close">✕</button></div>
-    <div class="graph-modal-sub">One system, <b>two frameworks</b>. Temporal's parent workflow spawns a <b>Google ADK</b> assessment child and a <b>LangGraph</b> dispatch child, then joins them—the only cross-framework coordinator. In the agent-initiated path, Dispatch calls the model-visible <code>ask_human</code> tool; LangGraph interrupts, the child waits durably in Temporal, and the answer signal becomes the agent's next observation. In the human-initiated path, an external customer-change signal is workflow input—not an ADK tool call—and approval re-runs both children before the held driver reroutes.</div>
+    <div class="graph-modal-sub">One system, <b>two frameworks</b>. Temporal's parent workflow runs a <b>Google ADK</b> assessment child, then a <b>LangGraph</b> dispatch child, and applies the result. Temporal coordinates the handoff between the ADK child and the LangGraph child and makes it durable. In the agent-initiated path, Dispatch calls the model-visible <code>ask_human</code> tool; LangGraph interrupts, the child waits durably in Temporal, and the answer signal becomes the agent's next observation. In the human-initiated path, an external customer-change signal is workflow input—not an ADK tool call—and approval re-runs both children before the held driver reroutes.</div>
     <div class="graph-flow">
       <svg viewBox="0 0 580 372" width="100%" style="max-width:1440px;display:block;margin:0 auto;font-family:inherit;" role="img" aria-label="Cross-framework flow: a Temporal parent workflow coordinates Google ADK assessment and LangGraph dispatch children; the Dispatch agent can call an in-loop ask_human tool whose interrupt waits durably for an answer signal before the answer returns as its next observation">
         <defs>
@@ -1500,7 +1515,7 @@
         <text x="72" y="118" text-anchor="middle" fill="#aab8cc" font-size="10.5" font-weight="600">⏳ Temporal</text>
         <text x="72" y="132" text-anchor="middle" fill="#aab8cc" font-size="10.5" font-weight="600">parent</text>
         <text x="72" y="150" text-anchor="middle" fill="#9fb4c7" font-size="8.5">start_child × 2</text>
-        <text x="72" y="162" text-anchor="middle" fill="#9fb4c7" font-size="8.5">gather · apply</text>
+        <text x="72" y="162" text-anchor="middle" fill="#9fb4c7" font-size="8.5">in sequence · apply</text>
         <text x="72" y="180" text-anchor="middle" fill="#7c93ab" font-size="8">orchestrates</text>
         <text x="72" y="191" text-anchor="middle" fill="#7c93ab" font-size="8">across frameworks</text>
 
@@ -1613,7 +1628,10 @@ const map = L.map('map', {
   attributionControl: false,
 }).setView([37.7900, -122.4050], 14);
 
-// Tile options — switch between styles
+// Tile options — switch between styles. (CARTO basemaps were dropped: they now need an
+// API key and render "API KEY REQUIRED" watermarks.)
+const OSM_TILES = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+const OSM_ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
 const tileLayers = {
   'Google Maps': L.tileLayer('https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}', {
     maxZoom: 20,
@@ -1621,20 +1639,30 @@ const tileLayers = {
   'Google Satellite': L.tileLayer('https://mt1.google.com/vt/lyrs=s,h&x={x}&y={y}&z={z}', {
     maxZoom: 20,
   }),
-  'Dark Matter': L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-    maxZoom: 19,
-    subdomains: 'abcd',
-  }),
-  'Voyager': L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
-    maxZoom: 19,
-    subdomains: 'abcd',
-  }),
+  // Same OSM tiles, darkened by the .dark-tiles CSS filter (tile pane only)
+  'Dark (OpenStreetMap)': L.tileLayer(OSM_TILES, { maxZoom: 19, attribution: OSM_ATTRIBUTION }),
+  'OpenStreetMap': L.tileLayer(OSM_TILES, { maxZoom: 19, attribution: OSM_ATTRIBUTION }),
   'Watercolor': L.tileLayer('https://tiles.stadiamaps.com/tiles/stamen_watercolor/{z}/{x}/{y}.jpg', {
     maxZoom: 16,
   }),
 };
-// Default to Dark Matter
-tileLayers['Dark Matter'].addTo(map);
+const DEFAULT_TILE = 'Dark (OpenStreetMap)';
+const DARK_TILES = new Set(['Dark (OpenStreetMap)']);  // every other style is a light map
+
+// OpenStreetMap's tile policy requires visible credit. Shows only while a layer with an
+// attribution (the OSM styles) is on the map. Added before any layer so it tracks removals.
+L.control.attribution({ position: 'bottomleft', prefix: false }).addTo(map);
+
+function applyTileStyle(name) {
+  Object.values(tileLayers).forEach(l => map.removeLayer(l));
+  tileLayers[name].addTo(map);
+  const isDark = DARK_TILES.has(name);
+  const mapEl = document.getElementById('map');
+  mapEl.classList.toggle('dark-tiles', isDark);
+  // Adaptive sign colors: dark maps keep defaults, light maps get high-contrast styling
+  mapEl.classList.toggle('light-map', !isDark);
+}
+applyTileStyle(DEFAULT_TILE);
 
 // Custom map style picker (replaces default Leaflet control)
 const styleControl = L.control({ position: 'bottomright' });
@@ -1649,7 +1677,7 @@ styleControl.onAdd = function() {
       <span>Map Style</span>
     </div>
     <div class="style-picker-menu">
-      ${Object.keys(tileLayers).map(name => `<div class="style-option${name === 'Dark Matter' ? ' active' : ''}" data-style="${name}">${name}</div>`).join('')}
+      ${Object.keys(tileLayers).map(name => `<div class="style-option${name === DEFAULT_TILE ? ' active' : ''}" data-style="${name}">${name}</div>`).join('')}
     </div>
   `;
   const toggle = container.querySelector('.style-picker-toggle');
@@ -1661,15 +1689,10 @@ styleControl.onAdd = function() {
   container.querySelectorAll('.style-option').forEach(opt => {
     opt.addEventListener('click', (e) => {
       L.DomEvent.stopPropagation(e);
-      const name = opt.dataset.style;
-      Object.values(tileLayers).forEach(l => map.removeLayer(l));
-      tileLayers[name].addTo(map);
+      applyTileStyle(opt.dataset.style);
       container.querySelectorAll('.style-option').forEach(o => o.classList.remove('active'));
       opt.classList.add('active');
       menu.classList.remove('open');
-      // Adaptive sign colors: dark maps keep defaults, light maps get high-contrast styling
-      const isLight = (name !== 'Dark Matter');
-      document.getElementById('map').classList.toggle('light-map', isLight);
     });
   });
   L.DomEvent.disableClickPropagation(container);
@@ -2250,6 +2273,7 @@ async function approveChange(approved) {
 // --- Pattern B: agent called ask_human mid-loop; poll the question it parked on ---
 let _gateCurrentOrder = null;
 let _gateCurrentChildId = null;
+let _gateCardHtml = '';  // last render; skip identical re-renders so a text selection survives
 async function pollPendingDispatch() {
   const card = document.getElementById('dispatch-gate-card');
   try {
@@ -2265,16 +2289,24 @@ async function pollPendingDispatch() {
     // approval signal goes straight to that workflow (null for the inline langgraph tab).
     _gateCurrentChildId = b.child_id || null;
     const onum = (b.order_id || oid).replace(/^order-/, '#');
+    // Full ids for answering from the CLI (`temporal workflow signal ... answer_dispatch`):
+    // the same order_id and workflow the Approve / Reject buttons signal.
+    const signalTarget = _gateCurrentChildId || 'meltdown-demo';
     const escalated = b.escalated || b.approver_tier === 'backup';
     const escBadge = escalated
       ? `<div class="dgc-escalated">⏫ Escalated to backup approver (primary window timed out)</div>`
       : '';
-    document.getElementById('dgc-body').innerHTML =
+    const html =
       escBadge
       + `<div class="dgc-order"><b>Order ${escapeHtml(onum)}</b> · $${(b.order_value || 0).toLocaleString()} · ${escapeHtml(b.venue || '')}</div>`
+      + `<div class="dgc-ids">order_id <code>${escapeHtml(oid)}</code> · workflow <code>${escapeHtml(signalTarget)}</code></div>`
       + `<div class="dgc-rec">🤖 <b>${escapeHtml(b.agent || 'Agent')}</b> called <code>ask_human</code>:</div>`
       + `<div class="dgc-reason">"${escapeHtml(b.question || '')}"</div>`
       + `<div class="dgc-impact">LangGraph is interrupted. Temporal is durably waiting for this answer signal; your choice returns as the agent's next observation.</div>`;
+    if (html !== _gateCardHtml) {
+      document.getElementById('dgc-body').innerHTML = html;
+      _gateCardHtml = html;
+    }
     card.style.display = 'block';
   } catch (e) { /* demo not running yet — leave card hidden */ }
 }

@@ -24,6 +24,11 @@ from agent_fleet.models import (
     OrderStatus,
 )
 
+# Orders per driver, as shown by the Fleet tool (x/2). Keep in sync with DRIVER_CAPACITY
+# in workflows.py, which enforces it (kept literal here to avoid importing the heavy
+# workflows module into FleetState). The schema default below matches it too.
+DRIVER_CAPACITY = 2
+
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS drivers (
     driver_id TEXT PRIMARY KEY,
@@ -31,7 +36,7 @@ CREATE TABLE IF NOT EXISTS drivers (
     lng REAL NOT NULL,
     battery_pct REAL NOT NULL DEFAULT 100.0,
     status TEXT NOT NULL DEFAULT 'idle',
-    capacity INTEGER NOT NULL DEFAULT 3,
+    capacity INTEGER NOT NULL DEFAULT 2,
     disconnected INTEGER NOT NULL DEFAULT 0,
     recovering INTEGER NOT NULL DEFAULT 0,
     status_before_disconnect TEXT NOT NULL DEFAULT 'idle',
@@ -131,10 +136,18 @@ class FleetState:
         # the heavy workflows module into FleetState). 4 drivers — the deliberate squeeze.
         for letter in ["a", "b", "c", "d"]:
             did = f"driver-{letter}"
+            # Explicit capacity: an older fleet.db may still carry the old DEFAULT 3, and
+            # CREATE TABLE IF NOT EXISTS won't change it.
             await conn.execute(
-                "INSERT OR IGNORE INTO drivers (driver_id, lat, lng) VALUES (?, ?, ?)",
-                (did, WAREHOUSE.lat, WAREHOUSE.lng),
+                "INSERT OR IGNORE INTO drivers (driver_id, lat, lng, capacity) VALUES (?, ?, ?, ?)",
+                (did, WAREHOUSE.lat, WAREHOUSE.lng, DRIVER_CAPACITY),
             )
+        # INSERT OR IGNORE skips existing rows, so also migrate rows an older version seeded.
+        # Nothing changes capacity at runtime, so this only rewrites stale rows.
+        await conn.execute(
+            "UPDATE drivers SET capacity = ? WHERE capacity != ?",
+            (DRIVER_CAPACITY, DRIVER_CAPACITY),
+        )
         for agent in ("fleet_agent", "customer_agent", "resolver"):
             await conn.execute(
                 "INSERT OR IGNORE INTO agent_health (agent_name, online) VALUES (?, 1)",

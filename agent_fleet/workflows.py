@@ -45,6 +45,7 @@ with workflow.unsafe.imports_passed_through():
         sync_driver_position,
     )
     from agent_fleet.agents import create_assessment_team_agent, create_order_assignment_agent
+    from agent_fleet.config import GATE_ESCALATION_SECONDS
     from agent_fleet.langgraph_agents import DISPATCH_ONLY_GRAPH_NAME, GRAPH_NAME
     from agent_fleet.locations import WAREHOUSE
     from agent_fleet.models import (
@@ -125,9 +126,9 @@ WARMUP_HIDDEN = ["driver-d"]
 # pre-filter (non-platinum orders top out ~$1,950), NOT the escalation decision —
 # that stays the agent's prompt-driven call.
 GATE_REVIEW_VALUE = 2000
-# Primary approver window before escalation. Intentionally short for the demo;
-# production systems would normally wait minutes or hours.
-GATE_ESCALATION_SECONDS = 30
+# GATE_ESCALATION_SECONDS, the primary approver window before escalation, lives in config.py
+# so .env can change it. Intentionally short for the demo (30 s); production systems would
+# normally wait minutes or hours.
 
 # Long-lived entity workflows keep their history bounded by periodically continuing-as-new.
 # A driver runs deliveries indefinitely, so its event history would otherwise grow until it
@@ -1694,6 +1695,10 @@ class MeltdownDemoWorkflow:
             "assigned_driver_id": None,
             "status": "pending",
             "deadline_minutes": order.deadline_minutes,
+            # Re-reasons after an address change read these back (_rereason_crossframework,
+            # _rereason_order); without them the agents saw "revised order" at $0.
+            "event": order.event,
+            "order_value": order.order_value,
         }
 
         # Build driver snapshots from workflow state — passed to activity as input
@@ -1978,8 +1983,13 @@ class MeltdownDemoWorkflow:
         )
 
         if hold:
-            workflow.logger.info(f"[#{onum}] LangGraph dispatch held {order.order_id} (human)")
-            await self._reject_order(order, onum)
+            workflow.logger.info(f"[#{onum}] LangGraph dispatch held {order.order_id}")
+            # Only a human "reject" is a supervisor rejection. Any other HOLD is the Dispatch
+            # agent's own call, which can come right after a human approved.
+            agent_hold = ""
+            if not rejected:
+                agent_hold = "after a human approved it" if asked else "without asking a human"
+            await self._reject_order(order, onum, agent_hold=agent_hold)
         else:
             workflow.logger.info(
                 f"[#{onum}] LangGraph dispatch → {final_driver}"
@@ -2067,8 +2077,20 @@ class MeltdownDemoWorkflow:
             start_to_close_timeout=timedelta(seconds=10),
         )
 
-    async def _reject_order(self, order: OrderAssignmentResult, onum: str) -> None:
-        """A supervisor rejected the high-value order — don't commit fleet capacity."""
+    async def _reject_order(
+        self, order: OrderAssignmentResult, onum: str, agent_hold: str = ""
+    ) -> None:
+        """Don't commit fleet capacity. By default a supervisor rejected the high-value order.
+        A non-empty `agent_hold` means the Dispatch agent chose HOLD itself, and says when
+        (e.g. "after a human approved it")."""
+        if agent_hold:
+            content = f"Dispatch agent held order {order.order_id} (${order.order_value:,}) "
+            content += f"{agent_hold} — not dispatched, fleet capacity preserved."
+            summary = f"{order.order_id} held by Dispatch agent — not dispatched"
+        else:
+            content = f"Supervisor rejected high-value order {order.order_id} "
+            content += f"(${order.order_value:,}) — not dispatched, fleet capacity preserved."
+            summary = f"{order.order_id} rejected — not dispatched"
         if order.order_id in self._orders:
             self._orders[order.order_id]["status"] = "rejected"
         # Reflect the rejection in FleetState so the order shows as cancelled in the UI.
@@ -2085,15 +2107,12 @@ class MeltdownDemoWorkflow:
             PublishAgentEventInput(
                 agent_name="dispatch_gate",
                 event_type="change_rejected",
-                content=(
-                    f"Supervisor rejected high-value order {order.order_id} "
-                    f"(${order.order_value:,}) — not dispatched, fleet capacity preserved."
-                ),
-                summary=f"{order.order_id} rejected — not dispatched",
+                content=content,
+                summary=summary,
             ),
             start_to_close_timeout=timedelta(seconds=10),
         )
-        workflow.logger.info(f"[#{onum}] {order.order_id} rejected at dispatch gate")
+        workflow.logger.info(f"[#{onum}] {order.order_id} not dispatched: {summary}")
 
     # --- Cross-framework assignment (3rd tab): ADK assess child ∥ LangGraph dispatch child ---
 

@@ -9,7 +9,13 @@ and is tested manually via ./run.sh.
 """
 
 import asyncio
+import logging
+import os
+import subprocess
+import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from temporalio import activity
@@ -33,6 +39,8 @@ from agent_fleet.locations import VENUES, WAREHOUSE
 from agent_fleet.models import (
     DriverRouteInput,
     DriverRouteOrder,
+    OrderAssignmentResult,
+    PublishAgentEventInput,
 )
 from agent_fleet.queues import DELIVERY_QUEUE, WORKFLOWS_QUEUE
 from agent_fleet.simulation import fleet
@@ -412,3 +420,194 @@ async def test_deliver_order_cancel_race():
         "otherwise the workflow signals the parent order_delivered for a "
         "cancelled order and corrupts bookkeeping"
     )
+
+
+# --- MeltdownDemoWorkflow logic, offline (no worker, no Gemini) ---
+# These call the parent's methods directly. The fixture swaps the few workflow APIs they touch
+# for fakes, and records what they would publish to the UI.
+
+
+@pytest.fixture
+def offline_workflow_apis(monkeypatch):
+    """Stand-ins for workflow.execute_activity / execute_local_activity / logger / info so
+    MeltdownDemoWorkflow methods run outside a worker. Returns the published UI events."""
+    from agent_fleet import workflows
+
+    published: list[PublishAgentEventInput] = []
+
+    async def _execute_activity(*args, **kwargs):
+        return None
+
+    async def _execute_local_activity(fn, arg, **kwargs):
+        published.extend(arg if isinstance(arg, list) else [arg])
+
+    monkeypatch.setattr(workflows.workflow, "execute_activity", _execute_activity)
+    monkeypatch.setattr(workflows.workflow, "execute_local_activity", _execute_local_activity)
+    monkeypatch.setattr(workflows.workflow, "logger", logging.getLogger("test-workflow"))
+    monkeypatch.setattr(
+        workflows.workflow, "info", lambda: SimpleNamespace(workflow_id="meltdown-demo")
+    )
+    return published
+
+
+def _order(order_id: str, event: str = "", order_value: int = 0) -> OrderAssignmentResult:
+    venue = VENUES[0]
+    return OrderAssignmentResult(
+        order_id=order_id,
+        hotel=venue["hotel"],
+        delivery_lat=venue["coords"].lat,
+        delivery_lng=venue["coords"].lng,
+        driver_id="",
+        reasoning_summary="",
+        event=event,
+        order_value=order_value,
+    )
+
+
+@pytest.mark.parametrize("env_value, expected", [(None, 30), ("300", 300)])
+async def test_gate_escalation_seconds_comes_from_config(env_value, expected):
+    """The approver window is config: 30 s by default, or GATE_ESCALATION_SECONDS from .env.
+    A fresh interpreter reads the env var the way a worker process does at startup."""
+    from agent_fleet import config, workflows
+
+    assert workflows.GATE_ESCALATION_SECONDS == config.GATE_ESCALATION_SECONDS
+
+    env = {k: v for k, v in os.environ.items() if k != "GATE_ESCALATION_SECONDS"}
+    if env_value is not None:
+        env["GATE_ESCALATION_SECONDS"] = env_value
+    code = "from agent_fleet.config import GATE_ESCALATION_SECONDS as s; print(s)"
+    out = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert int(out.stdout) == expected
+
+
+async def test_rereason_keeps_event_and_order_value(offline_workflow_apis):
+    """After an approved address change, both re-reason paths see the order's real event and
+    value, not the old fallbacks ("revised order", $0)."""
+    from agent_fleet.workflows import MeltdownDemoWorkflow
+
+    wf = MeltdownDemoWorkflow()
+    wf._dispatch_mode = "crossframework"
+
+    async def _skip_children(order, driver_id, onum):  # the initial assignment isn't under test
+        return None
+
+    wf._run_crossframework_assignment = _skip_children
+    await wf._assign_order(_order("order-7", event="Keynote tonight", order_value=5400))
+    await asyncio.gather(*wf._langgraph_tasks)
+
+    revised = []
+
+    async def _capture_children(order, driver_id, onum, suffix, apply=True):
+        revised.append(order)
+
+    wf._dispatch_via_children = _capture_children
+    await wf._rereason_crossframework("order-7", "moved to Oracle Park")
+    assert (revised[0].event, revised[0].order_value) == ("Keynote tonight", 5400)
+
+    adk_inputs = []
+
+    async def _capture_adk(inp):
+        adk_inputs.append(inp)
+        return SimpleNamespace(agent_events=[])
+
+    wf._run_adk_assignment = _capture_adk
+    await wf._rereason_order("order-7", "moved to Oracle Park")
+    assert adk_inputs[0].event == "Keynote tonight"
+
+
+class _AsksOnceGraph:
+    """Stands in for the compiled LangGraph team: asks a human once, then returns `final`."""
+
+    def __init__(self, final: dict):
+        self.final = final
+        self.calls = 0
+
+    def compile(self, checkpointer=None):
+        return self
+
+    async def ainvoke(self, _input, config=None):
+        self.calls += 1
+        if self.calls == 1:
+            question = {"agent": "Dispatch Agent", "question": "Commit a truck to this order?"}
+            return {"__interrupt__": [SimpleNamespace(value=question)]}
+        return self.final
+
+
+@pytest.mark.parametrize(
+    "answer, expected",
+    [
+        ("approve", "Dispatch agent held order order-9 ($5,400) after a human approved it"),
+        ("reject", "Supervisor rejected high-value order order-9 ($5,400)"),
+    ],
+)
+async def test_hold_message_says_who_held(offline_workflow_apis, monkeypatch, answer, expected):
+    """If a human approves and the Dispatch agent still decides HOLD, the UI must not say
+    'Supervisor rejected'. A human reject still does."""
+    from agent_fleet import workflows
+
+    team = _AsksOnceGraph({"dispatch_decision": "HOLD", "asked_human": True})
+    monkeypatch.setattr(workflows, "graph", lambda name: team)
+    wf = workflows.MeltdownDemoWorkflow()
+
+    async def _human_answers(order_id):
+        return answer
+
+    wf._await_dispatch_answer = _human_answers
+    await wf._run_langgraph_assignment(_order("order-9", order_value=5400), "driver-a", "9")
+
+    gate = [e for e in offline_workflow_apis if e.event_type == "change_rejected"]
+    assert len(gate) == 1
+    assert gate[0].content.startswith(expected)
+
+
+@pytest.mark.parametrize(
+    "reply, decision",
+    [
+        ("DISPATCH driver-a — closest with capacity.", "DISPATCH"),
+        ("No need to hold — dispatch driver-a.", "DISPATCH"),
+        ("Holding is unnecessary — dispatch driver-a.", "DISPATCH"),
+        ("HOLD — no driver should take this.", "HOLD"),
+        ("**Decision:** hold until a truck frees up.", "HOLD"),
+        ("Held: the supervisor rejected it.", "HOLD"),
+    ],
+)
+async def test_text_decision_reads_the_leading_word(reply, decision):
+    """Without a submit_dispatch call, only a reply that LEADS with the decision holds."""
+    from agent_fleet.langgraph_agents import _text_decision
+
+    assert _text_decision(reply) == decision
+
+
+async def test_dispatch_reason_does_not_hold_on_a_mention(monkeypatch):
+    """The Dispatch node's plain-text fallback: mentioning 'hold' is not a HOLD."""
+    from langchain_core.messages import AIMessage
+
+    from agent_fleet import langgraph_agents
+
+    class _FakeChatModel:
+        async def ainvoke(self, messages):
+            return AIMessage(content="No need to hold this routine order — dispatch driver-a.")
+
+    monkeypatch.setattr(langgraph_agents, "_chat_model", lambda tools=None: _FakeChatModel())
+    out = await langgraph_agents.dispatch_reason(
+        {
+            "venue": "Chinatown",
+            "order_value": 900,
+            "servings": 40,
+            "deadline_minutes": 30,
+            "drivers_available": 3,
+            "drivers_total": 4,
+            "pending_orders": 0,
+            "eligible_drivers": ["driver-a", "driver-b"],
+            "fleet_assessment": "driver-a — 4min ETA",
+            "customer_assessment": "standard",
+        }
+    )
+    assert out["dispatch_decision"] == "DISPATCH"

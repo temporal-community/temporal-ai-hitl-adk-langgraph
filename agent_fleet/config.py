@@ -7,8 +7,11 @@ from pathlib import Path
 
 GOOGLE_API_KEY: str | None = os.environ.get("GOOGLE_API_KEY")
 GOOGLE_MAPS_API_KEY: str | None = os.environ.get("GOOGLE_MAPS_API_KEY")
-DEFAULT_MODEL: str = os.environ.get("DEFAULT_MODEL", "gemini-2.5-flash")
+# Google recommends 3.8 Flash for new projects; 2.5 models only serve keys that used them before.
+DEFAULT_MODEL: str = os.environ.get("DEFAULT_MODEL", "gemini-3.8-flash")
 TEMPORAL_ADDRESS: str = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
 FLEET_DB_PATH: str = os.environ.get(
     "FLEET_DB_PATH", str(Path(__file__).parent.parent / "fleet_state.db")
 )
+# Seconds an unanswered ask_human waits before escalating to a backup approver (short for the demo).
+GATE_ESCALATION_SECONDS: int = int(os.environ.get("GATE_ESCALATION_SECONDS", "30"))
