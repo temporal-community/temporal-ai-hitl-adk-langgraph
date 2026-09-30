@@ -106,11 +106,22 @@ echo "  Temporal: http://localhost:8233"
 echo ""
 echo "Press Ctrl+C to stop."
 
-while kill -0 "$TEMPORAL_PID" 2>/dev/null \
-    && kill -0 "$WORKER_PID" 2>/dev/null \
-    && kill -0 "$SERVER_PID" 2>/dev/null; do
+# The worker is meant to die mid-demo (`make kill-worker` / `make stop-worker`), so its exit
+# must not end this script: the dev server keeps workflow history in memory, and the EXIT trap
+# would stop it and erase the parked workflows. Keep going while Temporal and the server are up.
+while kill -0 "$TEMPORAL_PID" 2>/dev/null && kill -0 "$SERVER_PID" 2>/dev/null; do
+    if [[ -n "$WORKER_PID" ]] && ! kill -0 "$WORKER_PID" 2>/dev/null; then
+        # Forget the PID so cleanup never signals a reused one. A worker started later with
+        # `make worker` belongs to that terminal; stop it there (or with `make stop-worker`).
+        WORKER_PID=""
+        echo "Worker stopped — workflows are parked in Temporal. Bring it back with: make worker"
+    fi
     sleep 1
 done
 
-echo "A demo service exited unexpectedly." >&2
+if ! kill -0 "$TEMPORAL_PID" 2>/dev/null; then
+    echo "Temporal dev server exited unexpectedly; stopping the demo." >&2
+else
+    echo "Server exited unexpectedly; stopping the demo." >&2
+fi
 exit 1
