@@ -398,6 +398,18 @@ The server loads `.env` via `load_dotenv()`. Two keys are required for live mode
   measured end to end on `gemini-3.8-flash` on 2026-09-30 (README, Cost to run)
 - `GATE_ESCALATION_SECONDS` (default 30) lives in `config.py` and is imported into
   `workflows.py` inside `imports_passed_through()`; it's read once per worker process
+- Temporal owns retries: `LLM_MAX_RETRIES = 0` (`config.py`) sets every LLM client to one
+  attempt, so a failed model call fails its activity and Temporal's retry policy retries it.
+  LangGraph: `init_chat_model(..., max_retries=0)` in `_chat_model` (the langchain-google-genai
+  default is 6; the pinned google-genai 1.75.0 reads 0 as one attempt). ADK: the plugin's
+  `invoke_model` builds `Gemini` by name (no `retry_options` knob), so each agent passes
+  `generate_content_config=_one_attempt_config()` (`HttpRetryOptions(attempts=1)`, applied per
+  request); ADK's internal `google_search_agent` keeps the default `retry_options=None` (one
+  attempt). `tool_search_venue_events` builds its `genai.Client` with `attempts=1`. Don't add
+  client-side retries; `tests/test_workflows.py` and `tests/test_activities.py` pin these.
+  Known gap with no public knob: aiohttp is locked (via `google-cloud-aiplatform`), and
+  google-genai's async aiohttp path resends once after a connection failure (not an HTTP
+  error), so ADK and LangGraph calls can send twice inside one activity attempt
 - `DRIVER_CAPACITY = 2` is defined in both `workflows.py` (enforced) and `simulation.py` (what
   the Fleet tool reports); keep them equal
 - Cost is always stated as tokens AND dollars (model, settings, calls, tokens, $, measured vs
@@ -425,13 +437,17 @@ uv sync --all-extras   # install / refresh deps (creates .venv/)
 uv run ruff check .    # lint
 uv run ruff format .   # format
 uv run pytest          # run tests
+make setup             # uv sync --all-extras --frozen (the locked install run.sh does)
 make lint              # ruff check + format check (via uv)
 make fmt               # ruff fix + format (via uv)
 make test              # pytest (via uv)
-make run               # start the demo
+make run               # start the demo (./run.sh always starts clean)
+make reset             # curl -fsS -X POST http://localhost:8080/api/reset (= Reset button; app must be running)
 make kill-worker       # SIGKILL the worker (a real crash); badge goes offline within ~9 s
+make failure           # same as make kill-worker
 make stop-worker       # SIGTERM the worker (graceful); badge goes offline within ~3 s
 make worker            # start a worker with --env-file .env; it replays open workflows
+make recovery          # same as make worker
 uv run python scripts/token_usage.py   # tokens + $ per pass from local Temporal history
 ```
 

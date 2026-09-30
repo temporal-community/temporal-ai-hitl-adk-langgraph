@@ -1,7 +1,11 @@
-.PHONY: install lint fmt test run worker kill-worker stop-worker
+.PHONY: install setup lint fmt test run reset worker kill-worker stop-worker failure recovery
 
 install:
 	uv sync --all-extras
+
+# The locked install run.sh does: installs exactly what uv.lock pins, without updating it.
+setup:
+	uv sync --all-extras --frozen
 
 lint:
 	uv run ruff check . && uv run ruff format --check .
@@ -14,6 +18,13 @@ test:
 
 run:
 	./run.sh
+
+# Same as the dashboard's Reset button: terminates the demo workflows and clears FleetState.
+# The app must be running (`make run` / ./run.sh in another terminal). You only need this
+# between runs; ./run.sh itself always starts clean (new in-memory dev server, fresh FleetState).
+reset:
+	curl -fsS -X POST http://localhost:8080/api/reset
+	@echo; echo "Wait about 15 s, reload the dashboard, then Start Deliveries."
 
 # --- Durability demo: kill the worker mid-run, then bring it back ---
 # Temporal + the web server keep running, so the paused workflow survives in Temporal's
@@ -32,3 +43,8 @@ stop-worker:
 
 worker:
 	uv run --env-file .env python -m agent_fleet.worker
+
+# Framework names for the same beat: failure = kill-worker (SIGKILL), recovery = worker.
+failure: kill-worker
+
+recovery: worker

@@ -781,6 +781,20 @@ No `@activity.defn` decorator, no explicit registration. **ADK composes and
 sequences agents; Temporal makes every external call durable.** This is the
 recommended pattern for `temporalio[google-adk]`.
 
+**Model calls retry in one place: Temporal.** Every LLM client makes a single attempt
+(`LLM_MAX_RETRIES = 0` in `config.py`), so a failed call fails its activity and Temporal's
+retry policy retries it. You see each attempt in the event history, and
+`scripts/token_usage.py` counts it. The plugin's `invoke_model` builds ADK's `Gemini` from
+the model name, so there is no `Gemini(retry_options=...)` to set. Instead each agent passes
+`generate_content_config=_one_attempt_config()` (`HttpRetryOptions(attempts=1)`), which
+google-genai applies per request. The LangGraph side passes `max_retries=0` to
+`init_chat_model` (the langchain-google-genai default is 6 tries inside one activity attempt),
+and the venue-search activity builds its `genai.Client` with `attempts=1`. One resend
+has no knob: with aiohttp installed (it is, through `google-cloud-aiplatform`), google-genai's
+async path resends a request once after a connection failure (not after an HTTP error such as
+a 429). ADK and LangGraph model calls are async, so that resend happens inside the activity,
+out of Temporal's sight.
+
 **Maps errors behave differently in the two places they happen.** `tool_get_route_info`
 (the agents' ETA tool) calls the Directions API; when it fails after its retries, the
 error goes back to the model as text (`ERROR: Tool tool_get_route_info failed: ...` in ADK,

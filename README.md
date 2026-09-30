@@ -19,6 +19,21 @@ wait in Temporal's event history instead: kill the Worker while an agent waits
 on a person, answer with no Worker running, restart it, and the answer arrives
 as the agent's next step.
 
+<!-- Recapture this screenshot: it predates the dark OpenStreetMap default map (2026-09-30). -->
+<p align="center">
+  <a href="frontend/img/aie-world-fair-ui-demo-view.png">
+    <img src="frontend/img/aie-world-fair-ui-demo-view.png" alt="The Ziggy's dashboard on the Cross-Framework tab: order controls and the ADK Fleet and Customer agent assessments on the left, the delivery fleet and customer orders across the top, and a dark map of downtown San Francisco with delivery trucks, Ziggy's at the Ferry Building, and the Fisherman's Wharf, Chinatown, and Moscone Center venues" width="900">
+  </a>
+  <br>
+  <em>The live fleet, customer orders, and agent reasoning in one view. Select the image for the full-resolution capture.</em>
+</p>
+
+**Last verified:** 2026-09-30 — three full 50-order passes on `gemini-3.8-flash`
+(Human → Agent, Agent → Human, Cross-Framework), measured in
+[Cost to run](#cost-to-run). Those passes ran just before the client-retry
+settings in [Retries live in Temporal](#retries-live-in-temporal) were set to
+zero; offline tests cover the new settings.
+
 Ziggy's Ice Cream runs a four-driver delivery fleet in downtown San Francisco.
 Google ADK and LangGraph own the agent loops. Temporal sits underneath them as
 the durable-execution runtime, preserving agent calls, delivery progress, human
@@ -28,14 +43,6 @@ This repository accompanies the AI Engineer World's Fair talk
 [*The Human Is an Async API: Designing Durable Human-in-the-Loop Agents*](aie-world-fair-slides.pdf)
 and the Temporal article
 [*Durable, flexible multi-agent systems*](https://temporal.io/blog/durable-flexible-multi-agent-systems).
-
-<p align="center">
-  <a href="frontend/img/aie-world-fair-ui-demo-view.png">
-    <img src="frontend/img/aie-world-fair-ui-demo-view.png" alt="Ziggy's Ice Cream dashboard with a live San Francisco delivery fleet and ADK and LangGraph reasoning panels" width="900">
-  </a>
-  <br>
-  <em>The live fleet, customer orders, and agent reasoning in one view. Select the image for the full-resolution capture.</em>
-</p>
 
 ## See the idea in 30 seconds
 
@@ -172,6 +179,35 @@ The cross-framework tab makes the handoff explicit:
   <img src="frontend/img/aie-world-fair-diagram.png" alt="A Temporal parent coordinates an ADK assessment child, a LangGraph dispatch child, and the driver delivery Workflow" width="560">
 </p>
 
+### Retries live in Temporal
+
+Every LLM client is set to zero retries (`LLM_MAX_RETRIES = 0` in
+`config.py`). A failed model call fails its Activity, and Temporal retries it,
+so each attempt shows up in the Temporal UI instead of inside an SDK. The model
+Activities (`invoke_model` for ADK, `*_reason` for LangGraph) use Temporal's
+default retry policy: unlimited attempts, backoff from 1 s to 100 s, and 60 s
+per attempt.
+
+- **LangGraph** (`ChatGoogleGenerativeAI` from `init_chat_model`):
+  `max_retries=0`. The library default, 6, made up to six tries inside one
+  Activity attempt. The pinned google-genai 1.75.0 treats 0 as one try, and a
+  test checks that.
+- **ADK:** the Temporal plugin builds ADK's `Gemini` from the model name, so it
+  has no constructor knob. Each agent sets `HttpRetryOptions(attempts=1)` in its
+  `generate_content_config` instead, and google-genai applies it per request.
+  ADK's internal `google_search_agent` has no knob at all. It keeps
+  `retry_options=None`, which google-genai also treats as one try.
+- **Venue search** (the `google.genai.Client` in `tool_search_venue_events`):
+  `attempts=1`. This Activity returns "Event search unavailable" instead of
+  raising, so an API error there isn't retried (only a 20 s timeout is), and
+  the Customer agent reasons without the search.
+- **One resend has no knob.** `uv.lock` installs aiohttp (through
+  `google-cloud-aiplatform`), so google-genai 1.75.0 sends async calls through
+  aiohttp. That path resends a request once, after a 1–10 s pause, when the
+  connection fails (refused, DNS, server disconnect). HTTP errors such as 429
+  and 5xx aren't resent. ADK and LangGraph model calls are async and take this
+  path; the venue search is sync and doesn't. Temporal doesn't see that resend.
+
 ## Run the demo
 
 ### Prerequisites
@@ -189,16 +225,19 @@ The cross-framework tab makes the handoff explicit:
   billing. Every truck movement calls it. Google lists the Directions API as
   Legacy, so check that your project can enable it.
 
-The two Google keys must be separate. This is a live-model demo; there is no
-mock mode. Google now serves `gemini-2.5-flash` only to accounts that used it
-before (checked 2026-09-29). To use another model, set `DEFAULT_MODEL` in `.env`.
+The two Google keys must be separate. **There is no key-free or mock mode:**
+the demo makes live Gemini and Maps calls, and the Worker won't start without
+both keys. Only the test suite runs without them
+([Develop and test](#develop-and-test)). Google now serves `gemini-2.5-flash`
+only to accounts that used it before (checked 2026-09-29). To use another
+model, set `DEFAULT_MODEL` in `.env`.
 
 ### Quickstart
 
 ```bash
-git clone https://github.com/temporal-community/durable-hitl-agents.git
-cd durable-hitl-agents
-cp .env.example .env
+git clone https://github.com/temporal-community/temporal-ai-hitl-adk-langgraph.git
+cd temporal-ai-hitl-adk-langgraph
+test -e .env || cp .env.example .env
 ```
 
 Replace both placeholders in `.env`. Optionally, check the Maps key first. This
@@ -279,9 +318,10 @@ Set these in `.env`. `run.sh` and `make worker` load it; the server loads it too
 4. On **Cross-Framework**, inspect the `assess-<order-id>` ADK child and
    `dispatch-<order-id>` LangGraph child in the Temporal UI.
 
-Between runs, click **Reset**, wait about 15 seconds, reload, then **Start
-Deliveries**. Starting while a run is still open returns HTTP 500. For timed
-stage cues and reset instructions, use the [demo delivery guide](DEMO_GUIDE.md).
+Between runs, click **Reset** (or run `make reset`), wait about 15 seconds,
+reload, then **Start Deliveries**. Starting while a run is still open returns
+HTTP 500. For timed stage cues and reset instructions, use the
+[demo delivery guide](DEMO_GUIDE.md).
 
 ### The money moment: kill the Worker while the agent waits
 
@@ -341,14 +381,18 @@ terminal 2; stop it there, or with `make stop-worker`, before a clean restart.
 | Video | What it shows | One measured pass (`gemini-3.8-flash`, 2026-09-30) | Link |
 | --- | --- | --- | --- |
 | Conference booth overview | The demo as shown at the conference booth (the video above) | — | [YouTube](https://youtu.be/kTPDzsXxKFg) |
-| Temporal & AI Demos: Durable Human-in-the-Loop & LangGraph (working title) | An agent asks through `ask_human`; the Worker is killed mid-wait; the answer still lands. A customer change holding a truck is the contrast | Agent → Human: 322 metered calls plus 51 venue searches, 732K tokens, $1.49. Human → Agent: 459 calls, 1.23M tokens, $1.44 | Coming soon |
-| Temporal & AI Demos: Multi-Agent Handoffs & Google ADK (working title) | One order crosses an ADK child (Fleet, Customer) and a LangGraph child (Dispatch) | Cross-Framework: 400 calls, 839K tokens, $1.55 | Coming soon |
+| Temporal & AI Series: Durable Human-in-the-Loop & LangGraph (working title) | An agent asks through `ask_human`; the Worker is killed mid-wait; the answer still lands. A customer change holding a truck is the contrast | Agent → Human: 322 metered calls plus 51 venue searches, 732K tokens, $1.49. Human → Agent: 459 calls, 1.23M tokens, $1.44 | Coming soon |
+| Temporal & AI Series: Multi-Agent Handoffs & Google ADK (working title) | One order crosses an ADK child (Fleet, Customer) and a LangGraph child (Dispatch) | Cross-Framework: 400 calls, 839K tokens, $1.55 | Coming soon |
 
 The multi-agent video's money moment: on **Cross-Framework**, drop the
 high-value order, wait until `dispatch-order-special-N` is parked on
 `ask_human`, then kill the Worker. After the restart and your answer,
 `assess-order-special-N` has gained no new events, the parent has recorded one
 completion for it, and the order is dispatched once.
+
+**As presented.** The last July 2026 showing ran the code tagged
+[`as-presented-2026-07`](https://github.com/temporal-community/temporal-ai-hitl-adk-langgraph/tree/as-presented-2026-07).
+`main` keeps moving; link the tag when you cite a talk.
 
 ## Cost to run
 
@@ -361,8 +405,8 @@ tokens:** a parked `ask_human` is a durable timer plus `wait_condition`.
 reported, read from local Temporal history). One full pass per tab: 50
 generated orders and a drained queue, plus the injected $5,400 order on Agent →
 Human and Cross-Framework. Every card was approved within about 3 seconds, no
-Worker was killed, and no model call was retried. Model `gemini-3.8-flash` with
-its default (medium) thinking. Paid-tier list prices per 1M tokens, checked
+Worker was killed, and no model Activity was retried. Model `gemini-3.8-flash`
+with its default (medium) thinking. Paid-tier list prices per 1M tokens, checked
 2026-09-29 at <https://ai.google.dev/gemini-api/docs/pricing>: $0.75 input,
 $0.075 cached, $3.75 output including thinking, through 2026-12-31. From
 2027-01-01 it's $1.50 / $7.50, which doubles these dollars.
@@ -393,7 +437,11 @@ per 1,000).
   prompt is 2–3× order #1's. Measure a full pass rather than multiplying an
   early per-order figure.
 - **Retries.** A call in flight when you kill the Worker runs again and is
-  billed again. Rejected 429s aren't billed, but they slow the run.
+  billed again. Rejected 429s aren't billed, but they slow the run. Apart
+  from google-genai's one resend after a connection failure, every model
+  retry is a Temporal Activity attempt
+  ([Retries live in Temporal](#retries-live-in-temporal)), so
+  `scripts/token_usage.py` counts it.
 
 **Measure it yourself** before you press Ctrl-C on `./run.sh`, because the dev
 server keeps history in memory. The script reads local history through the
@@ -481,24 +529,35 @@ recorded Worker output from one, rotate the Maps key.
 ## Develop and test
 
 ```bash
-uv sync --all-extras --frozen
+make setup
 make lint
 make test
 ```
 
 The test suite runs without Google keys and covers activity behavior, the
 SQLite projection, API request contracts, Worker startup validation, Temporal
-Signals and waits, per-order holds, cancellation races, and continue-as-new.
-The four `driver_route` tests download Temporal's test server on first run; use
-`uv run pytest -k "not driver_route"` offline.
+Signals and waits, per-order holds, cancellation races, continue-as-new, and
+the zero-retry LLM client settings. The four `driver_route` tests download
+Temporal's test server on first run; use `uv run pytest -k "not driver_route"`
+offline.
 
-```bash
-make run          # ./run.sh
-make kill-worker  # crash the Worker (SIGKILL); Temporal and the dashboard keep running
-make stop-worker  # graceful stop (SIGTERM); the badge flips within about 3 s
-make worker       # start a Worker with .env; it replays open Workflows from history
-uv run python scripts/token_usage.py  # tokens and dollars from local Temporal history
-```
+### Make targets
+
+Each target wraps one command, shown next to it. Run `reset`, `failure`, and
+`recovery` from a second terminal while `./run.sh` runs in the first.
+
+| Target | Raw command | What it does |
+| --- | --- | --- |
+| `make setup` | `uv sync --all-extras --frozen` | Installs exactly what `uv.lock` pins, as `run.sh` does |
+| `make install` | `uv sync --all-extras` | Same, but uv may update `uv.lock` |
+| `make run` | `./run.sh` | Starts Temporal, the Worker, and the dashboard, always from a clean state |
+| `make reset` | `curl -fsS -X POST http://localhost:8080/api/reset` | Same as the **Reset** button: terminates the demo Workflows and clears FleetState. The app must be running |
+| `make failure` or `make kill-worker` | `pkill -9 -f "[a]gent_fleet.worker"` | Crashes the Worker (SIGKILL); Temporal and the dashboard keep running |
+| `make recovery` or `make worker` | `uv run --env-file .env python -m agent_fleet.worker` | Starts a Worker with `.env`; it replays open Workflows from history |
+| `make stop-worker` | `pkill -f "[a]gent_fleet.worker"` | Graceful stop (SIGTERM); the badge flips within about 3 s |
+| `make lint` | `uv run ruff check . && uv run ruff format --check .` | Lint and format check |
+| `make fmt` | `uv run ruff check --fix . && uv run ruff format .` | Fix lint and format |
+| `make test` | `uv run pytest` | Runs the full test suite |
 
 ## Repository map
 
@@ -513,6 +572,7 @@ uv run python scripts/token_usage.py  # tokens and dollars from local Temporal h
 | `agent_fleet/simulation.py` | SQLite-backed dashboard projection |
 | `frontend/` | Single-page fleet dashboard and visual assets |
 | `scripts/token_usage.py` | Tokens and dollars per pass, read from local Temporal history |
+| `Makefile` | Setup, run, reset, failure/recovery, lint, and test targets ([Make targets](#make-targets)) |
 | `HOW_IT_WORKS.md` | Detailed architecture and execution mechanics |
 | `DEMO_GUIDE.md` | Talk track, demo flow, recovery beat, and reset steps |
 
