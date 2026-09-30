@@ -1,14 +1,20 @@
 """Unit tests for Temporal activities using ActivityEnvironment."""
 
+import httpx
 import pytest
+from temporalio.api.failure.v1 import Failure
+from temporalio.converter import DataConverter
 from temporalio.testing import ActivityEnvironment
 
+from agent_fleet import activities
 from agent_fleet.activities import (
     deliver_order,
     generate_order,
+    get_route_polyline,
     navigate_to,
     pickup_orders,
     sync_driver_position,
+    tool_get_route_info,
 )
 from agent_fleet.models import (
     DeliverInput,
@@ -132,3 +138,70 @@ async def test_pickup_orders_batch(env: ActivityEnvironment):
     o2 = await fleet.get_order("order-2")
     assert o1.status == OrderStatus.PICKED_UP
     assert o2.status == OrderStatus.PICKED_UP
+
+
+# --- Maps API key must never reach an activity failure ---
+
+FAKE_MAPS_KEY = "test-maps-key-do-not-leak"
+MAPS_ACTIVITIES = [
+    (get_route_polyline, (37.78, -122.40, 37.79, -122.41)),
+    (tool_get_route_info, (37.78, -122.40, 37.79, -122.41)),
+]
+
+
+def _mock_maps(monkeypatch, handler) -> list[httpx.Request]:
+    """Route the activities' httpx calls through a MockTransport (no network)."""
+    monkeypatch.setattr(activities, "GOOGLE_MAPS_API_KEY", FAKE_MAPS_KEY)
+    sent: list[httpx.Request] = []
+    real_client = httpx.AsyncClient
+
+    def recording_handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return handler(request)
+
+    monkeypatch.setattr(
+        activities.httpx,
+        "AsyncClient",
+        lambda **kw: real_client(transport=httpx.MockTransport(recording_handler), **kw),
+    )
+    return sent
+
+
+def _as_recorded_failure(exc: BaseException) -> str:
+    """Serialize an exception the way the worker writes it to Event History."""
+    failure = Failure()
+    DataConverter.default.failure_converter.to_failure(
+        exc, DataConverter.default.payload_converter, failure
+    )
+    return str(failure)
+
+
+@pytest.mark.parametrize(("fn", "args"), MAPS_ACTIVITIES)
+async def test_maps_http_error_does_not_leak_key(env: ActivityEnvironment, monkeypatch, fn, args):
+    """A non-2xx Maps response fails the activity without the key-bearing URL."""
+    sent = _mock_maps(monkeypatch, lambda request: httpx.Response(403))
+
+    with pytest.raises(RuntimeError, match="Maps Directions API HTTP 403") as exc_info:
+        await env.run(fn, *args)
+
+    assert FAKE_MAPS_KEY in str(sent[0].url)  # the key really was on the request URL
+    assert FAKE_MAPS_KEY not in str(exc_info.value)
+    assert FAKE_MAPS_KEY not in _as_recorded_failure(exc_info.value)
+
+
+@pytest.mark.parametrize(("fn", "args"), MAPS_ACTIVITIES)
+async def test_maps_transport_error_does_not_leak_key(
+    env: ActivityEnvironment, monkeypatch, fn, args
+):
+    """A timeout/connect error is re-raised without chaining the httpx error (and its URL)."""
+
+    def fail(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout(f"timed out calling {request.url}", request=request)
+
+    _mock_maps(monkeypatch, fail)
+
+    with pytest.raises(RuntimeError, match="request failed: ConnectTimeout") as exc_info:
+        await env.run(fn, *args)
+
+    assert exc_info.value.__cause__ is None and exc_info.value.__suppress_context__
+    assert FAKE_MAPS_KEY not in _as_recorded_failure(exc_info.value)

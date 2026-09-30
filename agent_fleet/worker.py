@@ -69,6 +69,8 @@ logger = logging.getLogger(__name__)
 logging.getLogger("temporalio.worker").setLevel(logging.WARNING)
 logging.getLogger("temporalio.activity").setLevel(logging.WARNING)
 logging.getLogger("temporalio.workflow").setLevel(logging.WARNING)
+# httpx logs every request URL at INFO, and Maps Directions puts the API key in the query string.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def create_workflow_worker(client: Client) -> Worker:
@@ -237,7 +239,8 @@ async def run_worker() -> None:
             task.cancel()
         await asyncio.gather(*tasks, shutdown_task, heartbeat_task, return_exceptions=True)
         # Remove the heartbeat so the UI flips to "offline" immediately on a clean stop
-        # (e.g. `make kill-worker`, which sends SIGTERM); a hard kill leaves it to age out.
+        # (Ctrl-C, or `make stop-worker`, which sends SIGTERM). `make kill-worker` sends
+        # SIGKILL, so this never runs and the heartbeat ages out instead.
         _WORKER_HEARTBEAT_PATH.unlink(missing_ok=True)
         logger.info("Workers stopped.")
 

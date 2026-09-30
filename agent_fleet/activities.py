@@ -103,9 +103,16 @@ async def get_route_polyline(
         "mode": "driving",
     }
 
+    # The API key rides in the query string, so errors name only the status or error type:
+    # raise_for_status() would put the full URL in the activity failure (Event History, the
+    # Temporal UI, the worker log). `from None` keeps the httpx error out of the failure chain.
     async with httpx.AsyncClient(timeout=8.0) as client:
-        resp = await client.get(url, params=params)
-        resp.raise_for_status()
+        try:
+            resp = await client.get(url, params=params)
+        except httpx.RequestError as e:
+            raise RuntimeError(f"Maps Directions API request failed: {type(e).__name__}") from None
+        if not resp.is_success:
+            raise RuntimeError(f"Maps Directions API HTTP {resp.status_code}")
         data = resp.json()
 
     if data.get("status") != "OK" or not data.get("routes"):
@@ -212,9 +219,14 @@ async def tool_get_route_info(
         "mode": "driving",
     }
 
+    # Key-safe errors, same as get_route_polyline above.
     async with httpx.AsyncClient(timeout=8.0) as client:
-        resp = await client.get(url, params=params)
-        resp.raise_for_status()
+        try:
+            resp = await client.get(url, params=params)
+        except httpx.RequestError as e:
+            raise RuntimeError(f"Maps Directions API request failed: {type(e).__name__}") from None
+        if not resp.is_success:
+            raise RuntimeError(f"Maps Directions API HTTP {resp.status_code}")
         data = resp.json()
 
     if data.get("status") != "OK" or not data.get("routes"):
