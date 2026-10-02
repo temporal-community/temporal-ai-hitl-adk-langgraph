@@ -99,11 +99,18 @@ not a third HITL pattern.
 | Tab | Framework path | Story |
 | --- | --- | --- |
 | **Human → Agent** | Google ADK | A customer submits a cancel or address change. The driver holds. On approval, the ADK team re-reasons an address change before the driver reroutes. |
-| **Agent → Human** | LangGraph | A high-value order makes an agent call `ask_human`. LangGraph interrupts the loop; Temporal preserves the wait; the answer returns to the loop. |
+| **Agent → Human** | LangGraph | A high-value order usually leads the agent to call `ask_human`. LangGraph interrupts the loop; Temporal preserves the wait; the answer returns to the loop. |
 | **Cross-Framework** | ADK child → LangGraph child | ADK assesses, LangGraph dispatches, and the Temporal parent applies the decision to the driver Workflow. Both HITL directions remain available. |
 
-All three use cases share the same operating rule: agent children **decide**,
-the parent Workflow **applies**, and driver Workflows **execute**.
+All three use cases share the same operating rule: agent teams **decide**, the
+parent Workflow **applies**, and driver Workflows **execute**. On
+Cross-Framework the teams run as child Workflows; on the other two tabs they run
+inline in the parent.
+
+The multi-agent failure is **the lost handoff**: the specialists finish, the
+process dies before their decision is applied, and you re-run them, drop the
+order, or apply it twice. On Cross-Framework, the parent's history records each
+child's result, so a restarted Worker continues from the next step.
 
 ## The durable primitives
 
@@ -152,18 +159,29 @@ and cross-framework child contracts, read [How it works](HOW_IT_WORKS.md).
 ```mermaid
 flowchart TB
     accTitle: Durable HITL agents architecture
-    accDescr: The dashboard sends Signals and Queries to MeltdownDemoWorkflow, the Temporal parent. The parent runs the Google ADK team or the LangGraph team inline (Fleet and Customer in parallel, then Dispatch), or on the Cross-Framework tab an ADK assessment child followed by a LangGraph dispatch child. It also runs four DriverRouteWorkflows with capacity 2 each. The agent teams call Gemini, Google Search, and Google Maps, and the drivers call Google Maps, all through Temporal Activities. The parent projects state into a SQLite FleetState file that the dashboard reads.
-    UI["Dashboard<br/>signals, queries, WebSocket projection"] --> P["MeltdownDemoWorkflow<br/>Temporal parent"]
+    accDescr: The browser dashboard talks to a FastAPI server over REST and a WebSocket. FastAPI starts MeltdownDemoWorkflow, the Temporal parent, and sends it Signals and Queries. The parent runs the Google ADK team or the LangGraph team inline (Fleet and Customer in parallel, then Dispatch), or on the Cross-Framework tab an ADK assessment child followed by a LangGraph dispatch child. It also runs four DriverRouteWorkflows with capacity 2 each. The agent teams call Gemini, Google Search, and Google Maps, and the drivers call Google Maps and run the delivery steps, all through Temporal Activities. Activities write positions, statuses, and agent events to a SQLite FleetState file. FastAPI also writes it for injected orders, resets, and driver and agent disconnects, and reads it to push snapshots to the dashboard.
+    UI["Dashboard<br/>browser"] -- "REST, /ws" --> API["FastAPI server<br/>server.py"]
+    API -- "start, Signals, Queries" --> P["MeltdownDemoWorkflow<br/>Temporal parent"]
     P --> A["Google ADK<br/>Fleet ∥ Customer → Dispatch"]
     P --> L["LangGraph<br/>Fleet ∥ Customer → Dispatch"]
     P --> X["Cross-framework children<br/>ADK assessment → LangGraph dispatch"]
     P --> D["4 DriverRouteWorkflows<br/>capacity 2 each"]
-    A --> G["Gemini, Search, Maps<br/>Temporal Activities"]
+    A --> G["Temporal Activities<br/>Gemini, Search, Maps, delivery steps"]
     L --> G
     X --> G
     D --> G
-    P -. "state projection" .-> DB["FleetState<br/>SQLite WAL"]
+    G -. "positions, statuses, agent events" .-> DB["FleetState<br/>SQLite WAL"]
+    API -. "orders, reset, disconnects" .-> DB
+    DB -. "snapshot, polled every 300 ms" .-> API
 ```
+
+Solid arrows are calls: browser requests, Temporal starts, Signals and Queries,
+child Workflows, and Activities. Dotted arrows are the dashboard projection:
+Activities and the FastAPI server write FleetState (the server for injected
+orders, Reset, and driver and agent disconnects), and FastAPI reads it and
+pushes changes over `/ws`.
+FleetState is not orchestration state; the Workflows keep that in Temporal
+history.
 
 The Worker process polls three Task Queues:
 
@@ -210,11 +228,19 @@ per attempt.
 
 ## Run the demo
 
+**No keys yet?** Start with the tests: `make setup && make test` needs no Google
+keys and makes no model calls, so it spends no tokens and adds no Google API
+charges. It doesn't run the demo; a real demo pass spends 0.73M–1.23M tokens and
+$1.44–$1.55 per tab ([Cost to run](#cost-to-run)). The first run downloads
+Temporal's test server for the four `driver_route` tests
+([Develop and test](#develop-and-test)).
+
 ### Prerequisites
 
 - macOS or Linux, Python 3.11 or newer
 - [uv](https://docs.astral.sh/uv/)
 - [Temporal CLI](https://docs.temporal.io/cli)
+- [jq](https://jqlang.org/), only for the optional Maps key check below
 - Free ports 7233, 8233, and 8080
 - `GOOGLE_API_KEY`, restricted to the Gemini API, on a project with **billing
   turned on**. The default model, `gemini-3.8-flash`, has no Grounding with
@@ -224,6 +250,10 @@ per attempt.
 - `GOOGLE_MAPS_API_KEY`, restricted to the Directions API, on a project with
   billing. Every truck movement calls it. Google lists the Directions API as
   Legacy, so check that your project can enable it.
+
+Tested on macOS with Python 3.13, uv 0.11.8, and Temporal CLI 1.6.2 (Server
+1.30.2, UI 2.45.3). `uv.lock` pins temporalio 1.27.2, google-adk 1.33.0, and
+langgraph 1.2.4.
 
 The two Google keys must be separate. **There is no key-free or mock mode:**
 the demo makes live Gemini and Maps calls, and the Worker won't start without
@@ -303,7 +333,7 @@ Set these in `.env`. `run.sh` and `make worker` load it; the server loads it too
 | `GOOGLE_MAPS_API_KEY` | none (required) | Directions API, for ETAs and truck routes |
 | `DEFAULT_MODEL` | `gemini-3.8-flash` | The model every agent uses |
 | `GATE_ESCALATION_SECONDS` | `30` | How long an unanswered `ask_human` waits before the backup-approver label. Read once when the Worker starts |
-| `MODEL_PROVIDER` | `google_genai` | LangChain provider for the LangGraph agents |
+| `MODEL_PROVIDER` | `google_genai` | LangChain provider for the LangGraph agents. Only `google_genai` is installed; another provider needs its LangChain package, and `DEFAULT_MODEL` is also used by the ADK agents |
 | `TEMPORAL_ADDRESS` | `localhost:7233` | Temporal frontend address |
 | `FLEET_DB_PATH` | `fleet_state.db` in the repo root | SQLite file the dashboard reads |
 
@@ -313,8 +343,9 @@ Set these in `.env`. `run.sh` and `make worker` load it; the server loads it too
    Ferry Building; four drivers batch up to two orders each.
 2. On **Human → Agent**, select an active order and submit an address change or
    cancellation. The driver waits at the venue while a supervisor decides.
-3. On **Agent → Human**, choose **Drop high-value order**. The agent calls
-   `ask_human`, and the approval card appears while the Workflow is parked.
+3. On **Agent → Human**, choose **Drop high-value order**. The agent usually
+   calls `ask_human`, and the approval card appears while the Workflow is
+   parked; if no card appears, drop another order.
 4. On **Cross-Framework**, inspect the `assess-<order-id>` ADK child and
    `dispatch-<order-id>` LangGraph child in the Temporal UI.
 
@@ -370,6 +401,19 @@ INFO:__main__:Workers started on queues: meltdown-workflows, meltdown-delivery, 
 Terminal 1 (`run.sh`) keeps running and prints
 `Worker stopped — workflows are parked in Temporal. Bring it back with: make worker`.
 
+**What to watch at <http://localhost:8233>.** Open `meltdown-demo` and its event
+history:
+
+- `WorkflowExecutionSignaled` (`answer_dispatch`) appears as soon as you signal
+  in step 4, with no Worker running. Temporal stores the Signal; the Worker
+  handles it after the restart.
+- A `TimerFired` `GATE_ESCALATION_SECONDS` after the agent asked (30 s by
+  default), even while no Worker is up: the escalation timer. The parent also
+  runs its own 30-second loop timer, so match the time to when the card
+  appeared.
+- The first `WorkflowTaskStarted` after `make worker` shows a new Worker
+  identity (a different `pid@host`).
+
 `make stop-worker` is the graceful version (SIGTERM); the badge flips within
 about 3 seconds. Model and tool calls that finished before the kill aren't run
 again; their results come from history. A call in flight at the kill runs
@@ -381,14 +425,16 @@ terminal 2; stop it there, or with `make stop-worker`, before a clean restart.
 | Video | What it shows | One measured pass (`gemini-3.8-flash`, 2026-09-30) | Link |
 | --- | --- | --- | --- |
 | Conference booth overview | The demo as shown at the conference booth (the video above) | — | [YouTube](https://youtu.be/kTPDzsXxKFg) |
-| Temporal & AI Series: Durable Human-in-the-Loop & LangGraph (working title) | An agent asks through `ask_human`; the Worker is killed mid-wait; the answer still lands. A customer change holding a truck is the contrast | Agent → Human: 322 metered calls plus 51 venue searches, 732K tokens, $1.49. Human → Agent: 459 calls, 1.23M tokens, $1.44 | Coming soon |
+| Temporal & AI Series: Durable Human-in-the-Loop Agents & LangGraph (working title) | An agent asks through `ask_human`; the Worker is killed mid-wait; the answer still lands. A customer change holding a truck is the contrast | Agent → Human: 322 metered calls plus 51 venue searches, 732K tokens, $1.49. Human → Agent: 459 calls, 1.23M tokens, $1.44 | Coming soon |
 | Temporal & AI Series: Multi-Agent Handoffs & Google ADK (working title) | One order crosses an ADK child (Fleet, Customer) and a LangGraph child (Dispatch) | Cross-Framework: 400 calls, 839K tokens, $1.55 | Coming soon |
 
 The multi-agent video's money moment: on **Cross-Framework**, drop the
 high-value order, wait until `dispatch-order-special-N` is parked on
-`ask_human`, then kill the Worker. After the restart and your answer,
-`assess-order-special-N` has gained no new events, the parent has recorded one
-completion for it, and the order is dispatched once.
+`ask_human`, then kill the Worker. After the restart and your answer, the order
+is dispatched once and the ADK assessment doesn't run again:
+`temporal workflow list --query "WorkflowId='assess-order-special-N'"` returns
+one execution, and `meltdown-demo` has one `StartChildWorkflowExecutionInitiated`
+and one `ChildWorkflowExecutionCompleted` for it.
 
 **As presented.** The last July 2026 showing ran the code tagged
 [`as-presented-2026-07`](https://github.com/temporal-community/temporal-ai-hitl-adk-langgraph/tree/as-presented-2026-07).
@@ -396,10 +442,16 @@ completion for it, and the order is dispatched once.
 
 ## Cost to run
 
-Temporal costs nothing here, because the dev server is local. You pay for
-Gemini tokens, plus Google Search and Maps Directions requests, which one pass
-keeps inside the free allowances. **Waiting on a human costs 0 model calls and 0
-tokens:** a parked `ask_human` is a durable timer plus `wait_condition`.
+One full pass on `gemini-3.8-flash` (default medium thinking, prices checked
+2026-09-29) spends 0.73M–1.23M tokens and $1.44–$1.55 per tab; all three tabs
+are 2.80M tokens and $4.48. A Worker restart replays from history and pays again
+only for calls in flight. **Reset** and **Start Deliveries**, or a new
+`./run.sh` after Ctrl-C, runs the whole pass from scratch and pays for it again.
+
+You pay for Gemini tokens, plus Google Search and Maps Directions requests,
+which one pass keeps inside the free allowances. The local Temporal dev server
+adds no charge. Waiting on a human makes no model calls and spends no tokens: a
+parked `ask_human` is a durable timer plus `wait_condition`.
 
 **Measured** on 2026-09-30 with `scripts/token_usage.py` (the usage Gemini
 reported, read from local Temporal history). One full pass per tab: 50
@@ -422,8 +474,9 @@ $0.075 cached, $3.75 output including thinking, through 2026-12-31. From
 **Not included:** Google Search fees past the free allowance (3.x models: 5,000
 queries a month free per paid key, then $14 per 1,000; the passes made 47, 51,
 and 40 grounded prompts), the tokens of the 51 LangGraph venue searches (each is
-a grounded Gemini call, so Agent → Human made 373 Gemini calls in all, but
-LangGraph doesn't keep their tokens in history), and Maps Directions requests
+a grounded Gemini call, so Agent → Human made 373 Gemini calls in all;
+LangGraph doesn't keep their tokens in history, and they aren't estimated
+here), and Maps Directions requests
 (151 to 175 a pass, inside the 10,000 a month free per billing account, then $5
 per 1,000).
 
@@ -441,7 +494,8 @@ per 1,000).
   from google-genai's one resend after a connection failure, every model
   retry is a Temporal Activity attempt
   ([Retries live in Temporal](#retries-live-in-temporal)), so
-  `scripts/token_usage.py` counts it.
+  `scripts/token_usage.py` counts the extra attempts but can't price them:
+  history keeps only the last attempt's result.
 
 **Measure it yourself** before you press Ctrl-C on `./run.sh`, because the dev
 server keeps history in memory. The script reads local history through the
@@ -473,10 +527,12 @@ Billing report are the final word.
   again. Tools with side effects need idempotency.
 - **Not sized for long runs.** Model inputs and outputs are stored in history.
   In the measured passes, `meltdown-demo` ended at about 9.4 MB (4,947 events)
-  on Human → Agent, just under Temporal's 10 MB warning; on Cross-Framework the
-  parent stayed at about 0.4 MB because the model calls run in child
-  Workflows. The continue-as-new guard counts events (10,000), not bytes, so on
-  a longer run the size warning comes first.
+  on Human → Agent, just under Temporal's 10 MB warning, and at about 7.3 MB
+  (4,402 events) on Agent → Human; on Cross-Framework the parent stayed at about
+  0.4 MB because the model calls run in child Workflows. The continue-as-new
+  guards on the parent and the drivers count events (10,000), not bytes, and
+  they don't fire in a normal pass. On a longer run the size warning comes
+  first.
 - **Not a routing system or production-hardened.** Trucks move along Maps
   routes in a SQLite-backed simulation. The client connects with
   `TEMPORAL_ADDRESS` only (no namespace, API key, or TLS), so as written it
@@ -489,13 +545,13 @@ Billing report are the final word.
 | --- | --- | --- | --- |
 | LangGraph + Postgres checkpointer | `interrupt()` in a node; resume with `Command(resume=...)` on the same `thread_id` | `PostgresSaver` stores the graph state; your app decides when to resume | There's one graph, one pause, and you already run Postgres |
 | OpenAI Agents SDK | Tools marked `needs_approval` stop the run; approve or reject on the `RunState`, then call `Runner.run(agent, state)` | Your app stores the serialized `RunState` | A web app already owns storage and resume endpoints |
-| Google ADK | Long-running function tools and tool confirmation (`require_confirmation`, experimental); resume by `invocation_id` | The session service | One ADK app with a short pause inside a session |
+| Google ADK | Long-running function tools and tool confirmation (`require_confirmation`, experimental); resume with a function response to the confirmation call. ADK's docs also ask for the same `invocation_id` when Resume is on (checked 2026-10-01) | The session service. ADK's docs list `DatabaseSessionService` and `VertexAiSessionService` as not supported for tool confirmation (checked 2026-10-01) | One ADK app with a short pause inside a session |
 | Pydantic AI | Deferred tools (`requires_approval` / `CallDeferred`) end the run with `DeferredToolRequests`; resume with `DeferredToolResults` | Wherever you store the message history (integrations exist for Temporal, DBOS, and Prefect) | You want framework-native approvals on your own storage |
 | Microsoft Agent Framework | Workflows raise request/response pairs (`RequestPort`, `request_info`); checkpoints include pending requests | A checkpoint store; the Durable Task extension waits for external events, with timeouts | Your team is standardized on Azure |
 | A2A protocol | A task enters `input-required`; the client continues the same task | Each agent's own implementation; the protocol defines the task states | You're connecting agents across vendors or frameworks (pair it with a durable-execution runtime) |
 | This repo (Temporal) | `ask_human` → LangGraph `interrupt()` → `workflow.wait_condition` until a Signal arrives | Temporal event history; any Worker can resume after replay, and the escalation timer survives a crash | You have many waits, timers, crash recovery, or handoffs across frameworks. The cost is running a Temporal server and Workers and following determinism rules |
 
-Sources, checked 2026-09-29:
+Sources, checked 2026-09-29 (ADK row rechecked 2026-10-01):
 [LangGraph interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts) ·
 [OpenAI Agents SDK HITL](https://openai.github.io/openai-agents-python/human_in_the_loop/) ·
 [ADK tool confirmation](https://adk.dev/tools-custom/confirmation/) ·
@@ -511,7 +567,9 @@ Sources, checked 2026-09-29:
 | --- | --- | --- |
 | `Error: uv is required.` or `Error: temporal is required.` | The tool isn't on your `PATH` | Install [uv](https://docs.astral.sh/uv/) or the [Temporal CLI](https://docs.temporal.io/cli) |
 | `RuntimeError: Missing required environment variables: GOOGLE_API_KEY ...`, then `Error: worker process exited during startup.` | `.env` is missing, a key is still a `your-...` placeholder, or the Worker was started without `--env-file` | `cp .env.example .env`, set both keys, then use `./run.sh` or `make worker` |
+| `Error: workers were not ready after 10 seconds.` | The Worker is running but hasn't written its heartbeat file yet. It writes it only after it connects to Temporal and creates its Workers, in the folder that holds `FLEET_DB_PATH` | Rerun `./run.sh`. If it repeats, check that the `FLEET_DB_PATH` folder (the repo root by default) is writable |
 | `Error: Temporal dev server exited before becoming ready.` or `Temporal dev server exited unexpectedly; stopping the demo.` | Ports 7233 or 8233 are taken, often by another Temporal dev server | Stop the other server, then rerun `./run.sh` |
+| `Error: Temporal dev server was not ready after 30 seconds.` | The dev server is still running but didn't report `SERVING` to `temporal operator cluster health` within 30 seconds, for example on a slow first start | Rerun `./run.sh`. If it repeats, read the dev server's output above the error |
 | `Server exited unexpectedly; stopping the demo.` | The FastAPI server died, often because port 8080 is taken | Free port 8080, then rerun `./run.sh` |
 | `Worker stopped — workflows are parked in Temporal. Bring it back with: make worker` | The Worker exited: `make kill-worker`, `make stop-worker`, or a crash | Expected during the demo. Run `make worker` |
 | `Maps Directions API returned status: REQUEST_DENIED` in the Temporal UI | The Directions API isn't enabled on the key's project, or the key is restricted to other APIs | Enable the Directions API, restrict the key to it, and rerun the preflight `curl` |
@@ -520,6 +578,7 @@ Sources, checked 2026-09-29:
 | `429 RESOURCE_EXHAUSTED` on `invoke_model` or `*_reason` (attempt > 1 in the Temporal UI) | Gemini rate limits, common on free-tier keys | Use a key with billing turned on |
 | `API key not valid. Please pass a valid API key.` (`API_KEY_INVALID`) | Wrong Gemini key | Copy the key again from AI Studio |
 | Start Deliveries fails with HTTP 500; the server log shows `WorkflowAlreadyStartedError` | A `meltdown-demo` run is still open | Click **Reset**, wait about 15 seconds, reload, then Start |
+| An order never dispatches, and the Temporal UI shows `WorkflowTaskFailed` on `assess-<order-id>` (Cross-Framework) or on `meltdown-demo` (Human → Agent, where the whole run stalls) | An exception inside the ADK agent loop. The loop runs in Workflow code with nothing catching it (`runner.run_async` in `workflows.py`), so Temporal fails the Workflow Task and retries it instead of failing the Workflow | Click **Reset**. To find a stuck run, use `temporal workflow list --query "TemporalReportedProblems IN ('category=WorkflowTaskFailed')"`, then open it in the Temporal UI to read the error |
 | `Escalated to backup approver (primary window timed out)` | The approval timer (`GATE_ESCALATION_SECONDS`, default 30) fired | Expected. Set a longer window in `.env` if you want one |
 
 The Worker quiets `httpx` request logging so Maps URLs, which carry the key,
@@ -536,8 +595,9 @@ make test
 
 The test suite runs without Google keys and covers activity behavior, the
 SQLite projection, API request contracts, Worker startup validation, Temporal
-Signals and waits, per-order holds, cancellation races, continue-as-new, and
-the zero-retry LLM client settings. The four `driver_route` tests download
+Signals and waits, per-order holds, cancellation races, driver continue-as-new
+(an integration test) and the parent's continue-as-new decision (unit tests),
+and the zero-retry LLM client settings. The four `driver_route` tests download
 Temporal's test server on first run; use `uv run pytest -k "not driver_route"`
 offline.
 
@@ -567,14 +627,25 @@ Each target wraps one command, shown next to it. Run `reset`, `failure`, and
 | `agent_fleet/agents.py` | Google ADK Fleet, Customer, and Dispatch team |
 | `agent_fleet/langgraph_agents.py` | LangGraph team, tools, `ask_human`, and graph routing |
 | `agent_fleet/activities.py` | Delivery, Maps, Search, and agent-tool Activities |
+| `agent_fleet/_activity_tool.py` | Wrapper that exposes Activities as ADK tools; a tool that runs out of retries returns an error string to the agent |
 | `agent_fleet/worker.py` | Three Task Queue Workers and plugin registration |
 | `agent_fleet/server.py` | Signal/query API, WebSocket feed, and frontend hosting |
 | `agent_fleet/simulation.py` | SQLite-backed dashboard projection |
+| `agent_fleet/config.py` | Environment settings, defaults, and `LLM_MAX_RETRIES = 0` |
+| `agent_fleet/models.py` | Workflow and Activity inputs, outputs, and status enums |
+| `agent_fleet/queues.py` | The three Task Queue names |
+| `agent_fleet/locations.py` | Ziggy's, the San Francisco venues, and the reroute choices |
 | `frontend/` | Single-page fleet dashboard and visual assets |
 | `scripts/token_usage.py` | Tokens and dollars per pass, read from local Temporal history |
+| `tests/` | Test suite; runs without Google keys ([Develop and test](#develop-and-test)) |
+| `run.sh` | Starts Temporal, the Worker, and the server, and stops only what it started |
 | `Makefile` | Setup, run, reset, failure/recovery, lint, and test targets ([Make targets](#make-targets)) |
+| `.env.example` | Template for `.env`: the two keys plus optional settings |
+| `pyproject.toml`, `uv.lock` | Dependencies and the locked versions `make setup` installs |
 | `HOW_IT_WORKS.md` | Detailed architecture and execution mechanics |
 | `DEMO_GUIDE.md` | Talk track, demo flow, recovery beat, and reset steps |
+| `AGENTS.md` | Instructions for coding agents: how to run and test, and the conventions to keep |
+| `aie-world-fair-slides.pdf` | Slides from the AI Engineer World's Fair talk |
 
 ## Next step
 
@@ -585,6 +656,25 @@ calls plus 51 venue searches, 0.73M tokens, and $1.49 a pass; all three tabs
 together are 1,181 metered calls plus those 51 searches, 2.80M tokens, and
 $4.48. Search fees, LangGraph venue-search tokens, and Maps are extra
 ([Cost to run](#cost-to-run)).
+
+## Resources
+
+- Temporal Python SDK docs:
+  [LangGraph integration](https://docs.temporal.io/develop/python/integrations/langgraph)
+  and [Google ADK integration](https://docs.temporal.io/develop/python/integrations/google-adk)
+  (the ADK page describes temporalio 1.28.0 or later; this repo locks 1.27.2)
+- [How it works](HOW_IT_WORKS.md): execution path, replay, Activity
+  boundaries, and the cross-framework child contracts
+- [Demo delivery guide](DEMO_GUIDE.md): stage cues, the recovery beat, and
+  reset steps
+- [Conference booth video](https://youtu.be/kTPDzsXxKFg); the Temporal & AI
+  Series videos are listed under [Videos](#videos)
+- [*Durable, flexible multi-agent systems*](https://temporal.io/blog/durable-flexible-multi-agent-systems)
+  on the Temporal blog
+- [*The Human Is an Async API*](aie-world-fair-slides.pdf): slides from the AI
+  Engineer World's Fair talk
+- [`as-presented-2026-07`](https://github.com/temporal-community/temporal-ai-hitl-adk-langgraph/tree/as-presented-2026-07):
+  the code as shown in July 2026
 
 ## Acknowledgements
 
