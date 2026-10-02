@@ -6,18 +6,43 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-2EA44F?style=for-the-badge)](LICENSE)
 
-**A visual Python demo of two durable human-in-the-loop patterns: a human changes
-an agent's work, and an agent asks a human for judgment.**
+This repo shows how agents can wait on a person, or hand work to another
+agent, without losing that work when a process crashes. Google ADK and
+LangGraph run the agent loops, and Temporal's role is to keep each wait and
+handoff in its event history, outside the Worker process.
+
+**What's covered:**
+
+- [The demo](#see-the-idea-in-30-seconds): the three tabs in one table, the
+  dashboard, and a recorded video.
+- [The core idea](#the-durable-primitives): in both human-in-the-loop
+  directions, a Signal changes Workflow state and `wait_condition` resumes the
+  work.
+- [Temporal's role](#the-boundary-that-matters) and [the limits](#what-this-is-not):
+  what each layer owns, and what the demo does not do. For example, a model call
+  in flight at a crash runs again.
+- [Gotchas](#troubleshooting): common errors and fixes, such as Gemini 429s on
+  free-tier keys or HTTP 500 when a run is still open.
+- [Cost to run](#cost-to-run): a measured pass on `gemini-3.8-flash` makes
+  300–460 model calls and spends 0.73M–1.23M tokens and $1.44–$1.55 per tab.
+  Starting over pays for the whole pass again; a Worker restart replays from
+  history and pays again only for calls in flight.
+- [How to run it](#run-the-demo): a Gemini key and a Maps key, both with
+  billing; there is no mock mode. Then [kill the Worker mid-wait](#the-money-moment-kill-the-worker-while-the-agent-waits).
+
+The demo is a visual Python app with two durable human-in-the-loop patterns: a
+human changes an agent's work, and an agent asks a human for judgment. A third
+tab, Cross-Framework, passes each order from an ADK agent team to a LangGraph
+agent team.
 
 A human is not a function that returns in 200 milliseconds. People answer in
 minutes, hours, or not at all, and during that gap the Worker running the agent
 gets redeployed, evicted, or crashes. If the pending question lives in process
 memory, a restart erases it without an error: the agent forgets it asked, the
 order is dropped or handled twice, and model calls you already paid for run
-again. We call this **the lost human-in-the-loop wait**. This repo keeps the
-wait in Temporal's event history instead: kill the Worker while an agent waits
-on a person, answer with no Worker running, restart it, and the answer arrives
-as the agent's next step.
+again. We call this **the lost human-in-the-loop wait**. In the demo, you kill
+the Worker while an agent waits on a person, answer with no Worker running, and
+restart it. The answer arrives as the agent's next step.
 
 <!-- Recapture this screenshot: it predates the dark OpenStreetMap default map (2026-09-30). -->
 <p align="center">
@@ -35,9 +60,9 @@ settings in [Retries live in Temporal](#retries-live-in-temporal) were set to
 zero; offline tests cover the new settings.
 
 Ziggy's Ice Cream runs a four-driver delivery fleet in downtown San Francisco.
-Google ADK and LangGraph own the agent loops. Temporal sits underneath them as
-the durable-execution runtime, preserving agent calls, delivery progress, human
-waits, and cross-framework handoffs when a Worker disappears.
+Temporal sits under the ADK and LangGraph agents as the durable-execution
+runtime, preserving agent calls, delivery progress, human waits, and
+cross-framework handoffs when a Worker disappears.
 
 This repository accompanies the AI Engineer World's Fair talk
 [*The Human Is an Async API: Designing Durable Human-in-the-Loop Agents*](aie-world-fair-slides.pdf)
